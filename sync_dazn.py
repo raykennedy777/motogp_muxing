@@ -86,10 +86,36 @@ def extract_wav(src, dst, stream_spec, start=None, duration=None,
             '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
     subprocess.run(cmd, check=True)
 
-def extract_seg(src, dst, stream_spec, start, duration):
-    """Extract a segment at 48 kHz stereo for final output concatenation."""
-    extract_wav(src, dst, stream_spec,
-                start=start, duration=duration, sr=48000, channels=2)
+def get_audio_params(src, stream_spec='a:0'):
+    """Return (codec_name, sample_rate, channels) for an audio stream."""
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', stream_spec,
+         '-show_entries', 'stream=codec_name,sample_rate,channels',
+         '-of', 'csv=p=0', str(src)],
+        capture_output=True, text=True, check=True)
+    codec, sr, ch = r.stdout.strip().split(',')
+    return codec, int(sr), int(ch)
+
+
+def extract_seg_copy(src, dst, stream_spec, start, duration):
+    """Stream-copy an audio segment (no decode/re-encode). Output to MKA."""
+    subprocess.run(
+        ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+         '-ss', f'{start:.3f}', '-t', f'{duration:.3f}',
+         '-i', str(src), '-map', stream_spec,
+         '-c:a', 'copy', '-avoid_negative_ts', 'make_zero', str(dst)],
+        check=True)
+
+
+def extract_seg_encode(src, dst, stream_spec, start, duration, sample_rate, channels):
+    """Encode an audio segment to AAC at the given sample rate and channel count."""
+    subprocess.run(
+        ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+         '-ss', f'{start:.3f}', '-t', f'{duration:.3f}',
+         '-i', str(src), '-map', stream_spec,
+         '-c:a', 'aac', '-b:a', '192k',
+         '-ar', str(sample_rate), '-ac', str(channels), str(dst)],
+        check=True)
 
 
 # ── Correlation ───────────────────────────────────────────────────────────────
@@ -380,7 +406,8 @@ def apply_mgp_sting_extension(breaks, mgp_sting_dazn, mgp_sting_dur=65.0):
 
 def build_and_concat(dazn, web_master, breaks,
                      pre_break_end_dazn, end_sting_dazn,
-                     offset, d_web, output_mka, dry_run=False):
+                     offset, d_web, output_mka,
+                     dazn_sr, dazn_ch, dry_run=False):
     """
     Build all output segments and concatenate to the output MKA.
 
@@ -390,6 +417,10 @@ def build_and_concat(dazn, web_master, breaks,
     Section 1: NS from master, t=0 -> pre_break_end_dazn - offset
     Section 2: DAZN with inner breaks replaced by NS from master
     Section 3: NS from master, end_sting_dazn - offset -> d_web
+
+    DAZN segments are stream-copied (no re-encode).
+    NS segments are encoded to AAC at dazn_sr/dazn_ch to match DAZN format.
+    All temp files are MKA; final concat uses -c:a copy.
     """
     tmp_dir = Path('_tmp_dazn_segs')
     if not dry_run:
@@ -400,14 +431,18 @@ def build_and_concat(dazn, web_master, breaks,
     def mtime(dazn_t):
         return dazn_t - offset
 
-    def new_seg(src, stream, start, duration, desc):
+    def new_seg(src, stream, start, duration, desc, copy=False):
         if duration <= 0:
             return
         counter[0] += 1
-        p = str(tmp_dir / f'seg_{counter[0]:04d}.wav')
+        p = str(tmp_dir / f'seg_{counter[0]:04d}.mka')
         print(f'  {desc}  start={start:.1f}s  dur={duration:.1f}s')
         if not dry_run:
-            extract_seg(src, p, stream, start=start, duration=duration)
+            if copy:
+                extract_seg_copy(src, p, stream, start=start, duration=duration)
+            else:
+                extract_seg_encode(src, p, stream, start=start, duration=duration,
+                                   sample_rate=dazn_sr, channels=dazn_ch)
         segs.append(p)
 
     # ── Section 1: Natural Sounds from master t=0 to pre_break_end ──
@@ -430,11 +465,11 @@ def build_and_concat(dazn, web_master, breaks,
             # Master has ended before this break; cap DAZN here
             dazn_dur = min(dazn_dur, d_web - mtime(dazn_cur))
             new_seg(dazn, '0:a:0', dazn_cur, dazn_dur,
-                    '[DAZN] cap at master end')
+                    '[DAZN] cap at master end', copy=True)
             dazn_cur = dazn_cur + dazn_dur
             break
         new_seg(dazn, '0:a:0', dazn_cur, dazn_dur,
-                f'[DAZN] -> master {mtime(dazn_cur):.1f}s')
+                f'[DAZN] -> master {mtime(dazn_cur):.1f}s', copy=True)
 
         # NS replacing the break
         brk_dur  = brk_e - brk_s
@@ -450,7 +485,7 @@ def build_and_concat(dazn, web_master, breaks,
 
     if final_dazn_dur > 0:
         new_seg(dazn, '0:a:0', dazn_cur, final_dazn_dur,
-                f'[DAZN] final -> master {mtime(dazn_cur):.1f}s')
+                f'[DAZN] final -> master {mtime(dazn_cur):.1f}s', copy=True)
 
     # ── Section 3: NS from end sting through master end ──
     end_sting_master = mtime(end_sting_dazn)
@@ -472,7 +507,7 @@ def build_and_concat(dazn, web_master, breaks,
     subprocess.run(
         ['ffmpeg', '-y', '-hide_banner',
          '-f', 'concat', '-safe', '0', '-i', list_path,
-         '-map', '0', '-c:a', 'aac', '-b:a', '192k', str(output_mka)],
+         '-map', '0', '-c:a', 'copy', str(output_mka)],
         check=True)
     os.remove(list_path)
 
@@ -522,11 +557,14 @@ def main():
         fp_list.append(fp_leadin_alt)
         print(f'  Using alt transition fingerprint: {fp_leadin_alt}')
 
-    # ── Durations ──
+    # ── Durations and audio format ──
     d_dazn = get_duration(dazn_file)
     d_web  = get_duration(web_master)
+    dazn_codec, dazn_sr, dazn_ch = get_audio_params(dazn_file, 'a:0')
     print(f'DAZN: {d_dazn:.1f}s ({d_dazn/3600:.2f}h)  |  '
           f'Web master: {d_web:.1f}s ({d_web/3600:.2f}h)')
+    print(f'DAZN audio: {dazn_codec} {dazn_sr}Hz {dazn_ch}ch '
+          f'(DAZN segments will be stream-copied; NS encoded to match)')
 
     # ── Find pre-race sting positions in web master (Natural Sounds track) ──
     print('\nLocating pre-race stings in web master...')
@@ -662,7 +700,8 @@ def main():
     print('\nBuilding output segments...')
     build_and_concat(dazn_file, web_master, breaks,
                      pre_break_end_dazn, end_sting_dazn,
-                     offset, d_web, output_mka, dry_run=dry_run)
+                     offset, d_web, output_mka,
+                     dazn_sr, dazn_ch, dry_run=dry_run)
 
     print(f'\nDone -> {output_mka}')
 
