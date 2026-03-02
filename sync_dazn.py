@@ -638,15 +638,25 @@ def main():
         print(f'    Break {i+1}: DAZN {s:.1f}s-{e:.1f}s  '
               f'dur={e-s:.1f}s  master {ms:.1f}s-{me:.1f}s')
 
-    # ── Identify pre-Moto3 break boundary ──
+    # ── Identify show-start break boundary ──
+    # Use the FIRST break ending before the Moto3 sting — that's the show intro break
+    # after which DAZN commentary begins.  Any subsequent pre-race breaks become inner
+    # Section 2 breaks and are filled with Natural Sounds at matching master times.
     pre_breaks = [(s, e) for s, e in breaks if e < m3_dazn]
     if not pre_breaks:
         sys.exit('ERROR: No break found ending before Moto3 sting in DAZN.')
-    pre_break = pre_breaks[-1]
+    pre_break = pre_breaks[0]
     pre_break_end_dazn = pre_break[1]
-    print(f'\nPre-Moto3 break : DAZN {pre_break[0]:.1f}s - {pre_break_end_dazn:.1f}s')
-    print(f'  DAZN commentary starts at DAZN {pre_break_end_dazn:.1f}s '
-          f'= master {pre_break_end_dazn - offset:.1f}s')
+
+    # If the show start maps to before master t=0, clamp to start concurrently.
+    if pre_break_end_dazn - offset < 0:
+        pre_break_end_dazn = offset   # mtime(offset) = 0
+        print(f'\nShow start is before master t=0; DAZN will start concurrently '
+              f'with master at DAZN {pre_break_end_dazn:.1f}s')
+    else:
+        print(f'\nShow-start break : DAZN {pre_break[0]:.1f}s - {pre_break_end_dazn:.1f}s')
+        print(f'  DAZN commentary starts at DAZN {pre_break_end_dazn:.1f}s '
+              f'= master {pre_break_end_dazn - offset:.1f}s')
 
     # ── Build output ──
     print('\nBuilding output segments...')
