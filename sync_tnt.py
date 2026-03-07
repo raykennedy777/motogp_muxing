@@ -308,6 +308,11 @@ def main():
         fp_list.append(fp_leadin_alt)
         print(f'  Using alt transition fingerprint: {fp_leadin_alt}')
 
+    fp_program_intro = str(FP_DIR / 'tnt_program_intro_2025.wav')
+    if Path(fp_program_intro).exists():
+        fp_list.append(fp_program_intro)
+        print(f'  Using 2025 program intro fingerprint: {fp_program_intro}')
+
     # ── Durations ──
     d_tnt = get_duration(tnt_file)
     d_web = get_duration(web_master)
@@ -375,7 +380,7 @@ def main():
               f'dur={e-s:.1f}s  master {ms:.1f}s-{me:.1f}s')
 
     # ── Identify pre-Moto3 break ──
-    pre_breaks = [(s, e) for s, e in breaks if e < m3_tnt]
+    pre_breaks = [(s, e) for s, e in breaks if s < m3_tnt]
     if not pre_breaks:
         sys.exit('ERROR: No break found before Moto3 sting in TNT.')
     pre_break = pre_breaks[-1]

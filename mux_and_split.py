@@ -300,7 +300,7 @@ def detect_split_points(web_master, polsat_master, moto2_webdl, motogp_webdl):
     motogp_start       = motogp_start_frame / FPS
     print(f'\nMotoGP frame-count anchor: '
           f'master={master_frames} frames  webdl={motogp_frames} frames  '
-          f'→ start=frame {motogp_start_frame} = {motogp_start:.3f}s '
+          f'-> start=frame {motogp_start_frame} = {motogp_start:.3f}s '
           f'({motogp_start / 60:.1f} min)')
 
     if motogp_start_frame < 0:
@@ -478,9 +478,13 @@ def main():
                     help='Directory tree containing WEB-DL subfolders')
     ap.add_argument('--output-dir',    metavar='DIR',
                     help='Output directory (default: wip-dir)')
-    ap.add_argument('--keep-combined', action='store_true',
+    ap.add_argument('--keep-combined',   action='store_true',
                     help='Keep combined_master.mkv after splitting')
-    ap.add_argument('--dry-run',       action='store_true',
+    ap.add_argument('--combined-master', metavar='FILE',
+                    help='Use existing combined MKV; skip the mux phase')
+    ap.add_argument('--year',            type=int, default=2025,
+                    help='Broadcast year for output filenames (default: 2025)')
+    ap.add_argument('--dry-run',         action='store_true',
                     help='Detect split points and print plan; no files written')
     args = ap.parse_args()
 
@@ -514,9 +518,10 @@ def main():
                               'dazn_*_synced.mka', '*dazn*synced*.mka',
                               '*dazn*.mka')
 
+    skip_mux = args.combined_master is not None
     for label, f in (('polsat_master', polsat_master), ('web_master', web_master),
                      ('tnt_mka',       tnt_mka),       ('dazn_mka',   dazn_mka)):
-        if not f:
+        if not f and not (skip_mux and label in ('tnt_mka', 'dazn_mka')):
             sys.exit(f'ERROR: Cannot find {label} in {wip_dir}')
 
     print(f'Round {round_str} {country} — {session}')
@@ -552,16 +557,36 @@ def main():
         print('\n[DRY RUN] Detection complete — no files written.')
         return
 
-    # ── Phase 2: Mux ──
     out_dir.mkdir(parents=True, exist_ok=True)
-    combined = out_dir / 'combined_master.mkv'
-    codec, resolution = mux_combined(
-        polsat_master, web_master, tnt_mka, dazn_mka, combined)
+
+    # ── Phase 2: Mux (or use existing combined master) ──
+    if skip_mux:
+        combined = Path(args.combined_master)
+        if not combined.exists():
+            sys.exit(f'ERROR: --combined-master not found: {combined}')
+        # Detect codec + resolution from the combined file
+        pol_vids, _ = identify_tracks(combined)
+        if not pol_vids:
+            sys.exit(f'ERROR: No video track in {combined}')
+        props      = pol_vids[0].get('properties', {})
+        dims       = props.get('pixel_dimensions', '1920x1080')
+        try:
+            height = int(dims.split('x')[1])
+        except (IndexError, ValueError):
+            height = 1080
+        codec_raw  = pol_vids[0].get('codec', '')
+        codec      = 'x265' if 'HEVC' in codec_raw else 'x264'
+        resolution = f'{height}p'
+        print(f'\nUsing existing combined master: {combined.name}  ({codec} {resolution})')
+    else:
+        combined = out_dir / 'combined_master.mkv'
+        codec, resolution = mux_combined(
+            polsat_master, web_master, tnt_mka, dazn_mka, combined)
 
     # ── Phase 3: Split ──
     def output_name(cls):
         return out_dir / (
-            f'{cls}.2026.Round{round_str}.{country}.{session}.'
+            f'{cls}.{args.year}.Round{round_str}.{country}.{session}.'
             f'Polsat.HDTV.{resolution}.{codec}.Multi5.mkv'
         )
 
@@ -575,8 +600,8 @@ def main():
         print(f'   -> {out_file.name}')
         smart_cut(combined, out_file, t_start, dur, codec)
 
-    # Optionally delete combined master
-    if not args.keep_combined and combined.exists():
+    # Optionally delete combined master (never delete a user-provided file)
+    if not skip_mux and not args.keep_combined and combined.exists():
         gc.collect()  # release PyAV file handles held by MediaContainer
         print(f'\nDeleting {combined.name}')
         combined.unlink()

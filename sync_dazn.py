@@ -12,7 +12,7 @@ Sync anchor: 5s pre-race sting found in both DAZN and web master.
              Moto2/MotoGP sting positions are reported but not used for time-warping.
 
 DAZN-specific:
-  - No lead-out sting: break ends detected via show intro sting fingerprint, with 73s fallback
+  - No lead-out sting: break ends detected via show intro sting, then watermark reappearance (-4s), with 73s fallback
   - 65s MotoGP intro sting at ~4h23m05s appears out-of-sync after a break (treated as break extension)
   - 7s end-program sting marks handoff from DAZN to Natural Sounds tail
 
@@ -51,14 +51,16 @@ DAZN_END_STING_SEARCH   = (18600, 2400)  # end program sting: ~5h10m, 40 min win
 SHOWINTRO_SEARCH_SECS    = 900  # how far after lead-in to search for show intro sting (15 min)
 DAZN_FALLBACK_BREAK_SECS = 73   # assumed break length when no other detection succeeds
 
-# MGP watermark video detection (fallback between show-intro sting and 73s)
+# Watermark video detection (fallback between show-intro sting and 73s, for all breaks)
 WM_SEARCH_SECS      = 300   # seconds to probe video for watermark after break lead-in
 WM_MIN_OFFSET_SECS  = 30    # ignore first N seconds of search (ad content won't end this fast)
-WM_CROP_RIGHT_FRAC  = 0.12  # rightmost fraction of frame width for watermark region
-WM_CROP_BOTTOM_FRAC = 0.07  # bottom fraction of frame height for watermark region
+WM_X                = 1730  # pixels from left edge of frame
+WM_Y                = 50    # pixels from top of frame
+WM_W                = 100   # crop width in pixels
+WM_H                = 100   # crop height in pixels
 WM_OUT_W            = 64    # downscaled width for template matching
 WM_OUT_H            = 32    # downscaled height for template matching
-WATERMARK_THRESH    = 0.44  # Pearson correlation threshold; only applied post-MotoGP-sting
+WATERMARK_THRESH    = 0.44  # Pearson correlation threshold
 WATERMARK_FPS       = 2     # frames per second to sample during break-end scan
 
 # Fingerprints directory (alongside this script)
@@ -268,8 +270,8 @@ def find_break_end_via_watermark(dazn, break_start, clip_dur,
             max_conf = conf
             max_conf_t = t_i
         if i >= min_frame and conf > WATERMARK_THRESH:
-            print(f'    Watermark conf={conf:.3f} at +{i*step:.1f}s (t={t_i:.1f}s)')
-            return t_i, True
+            print(f'    Watermark conf={conf:.3f} at +{i*step:.1f}s (t={t_i:.1f}s); break end = {t_i - 4.0:.1f}s')
+            return t_i - 4.0, True
 
     print(f'    Watermark not found (max={max_conf:.3f} at t={max_conf_t:.1f}s, '
           f'+{max_conf_t - search_start:.0f}s from search start)')
@@ -311,13 +313,12 @@ def find_break_end_via_showintro(dazn, fp_showintro_list, showintro_dur, break_s
 
 
 def detect_breaks_dazn(dazn, fp_list, fp_showintro_list, showintro_dur,
-                        wm_template=None, wm_x=0, wm_y=0, wm_w=0, wm_h=0,
-                        wm_after_t=0.0):
+                        wm_template=None, wm_x=0, wm_y=0, wm_w=0, wm_h=0):
     """
     Detect ad breaks in DAZN broadcast.
     Break-end detection hierarchy:
       1. Show intro sting fingerprint
-      2. MGP watermark in video (only for breaks at/after wm_after_t, i.e. during live MotoGP race)
+      2. Watermark reappearance in video (all breaks; break end = watermark time - 4s)
       3. DAZN_FALLBACK_BREAK_SECS (73s) last resort
     Returns list of (break_start, break_end) in DAZN time.
     """
@@ -335,7 +336,7 @@ def detect_breaks_dazn(dazn, fp_list, fp_showintro_list, showintro_dur,
         end, found = find_break_end_via_showintro(
             dazn, fp_showintro_list, showintro_dur, t, clip_dur)
 
-        if not found and wm_template is not None and t >= wm_after_t:
+        if not found and wm_template is not None:
             wm_end, wm_found = find_break_end_via_watermark(
                 dazn, t, clip_dur, wm_template, wm_x, wm_y, wm_w, wm_h)
             if wm_found:
@@ -585,45 +586,29 @@ def main():
         dazn_file, fp_end_sting,
         *DAZN_END_STING_SEARCH,
         label='  End program sting (DAZN)')
-    if end_conf < 0.1:
+    if end_conf < CONF_THRESH:
         print('  WARNING: End program sting not found; '
               'DAZN section will run to master end (no NS tail).')
         end_sting_dazn = offset + d_web
 
-    # ── Build MGP watermark template for video-based break-end detection ──
-    print('\nBuilding MGP watermark template...')
-    wm_template = wm_x = wm_y = wm_w = wm_h = None
+    # ── Build watermark template for video-based break-end detection ──
+    print('\nBuilding watermark template...')
+    wm_template = None
     try:
-        vid_w, vid_h = get_video_dimensions(dazn_file)
-        wm_w  = int(vid_w * WM_CROP_RIGHT_FRAC)
-        wm_h  = int(vid_h * WM_CROP_BOTTOM_FRAC)
-        wm_x  = vid_w - wm_w
-        wm_y  = vid_h - wm_h
         wm_ref = m3_dazn + 300   # 5 min into Moto3 — confirmed live coverage
         wm_template = build_watermark_template(
-            dazn_file, wm_ref, wm_x, wm_y, wm_w, wm_h)
+            dazn_file, wm_ref, WM_X, WM_Y, WM_W, WM_H)
         if wm_template is not None:
-            print(f'  Template at {wm_ref:.0f}s  '
-                  f'video={vid_w}x{vid_h}  '
-                  f'crop={wm_w}x{wm_h}@({wm_x},{wm_y})')
+            print(f'  Template at {wm_ref:.0f}s  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
         else:
             print('  Watermark detection disabled (template extraction failed).')
-            wm_x = wm_y = wm_w = wm_h = 0
     except Exception as e:
         print(f'  Watermark detection disabled: {e}')
-        wm_template = None
-        wm_x = wm_y = wm_w = wm_h = 0
 
     # ── Detect ad breaks ──
-    # Watermark detection only applies during live MotoGP race (after the 65s intro sting).
-    # Inter-race studio content doesn't show the MotoGP watermark; using watermark there
-    # would give false positives from ad content.
-    wm_after_t = (mgp_dazn + 65.0) if mgp_conf >= 0.1 else float('inf')
-    print(f'\nScanning DAZN for ad break lead-ins '
-          f'(watermark active for breaks after {wm_after_t:.0f}s)...')
+    print('\nScanning DAZN for ad break lead-ins (watermark fallback active for all breaks)...')
     breaks = detect_breaks_dazn(dazn_file, fp_list, fp_showintro_list, showintro_dur,
-                                 wm_template, wm_x, wm_y, wm_w, wm_h,
-                                 wm_after_t=wm_after_t)
+                                 wm_template, WM_X, WM_Y, WM_W, WM_H)
 
     # Apply MotoGP sting extension
     if mgp_conf >= 0.1:

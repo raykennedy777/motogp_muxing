@@ -57,7 +57,11 @@ Same as Sunday except:
 | `sync_canal.py` | Sync Canal+ French audio (4 race modes: sprint, moto3, moto2, motogp) |
 | `sync_sky.py` | Sync Sky Sport Italian audio (no ad breaks; sting-based sync) |
 | `sync_rts.py` | Sync RTS audio (optional opening/closing trim; sting-based sync) |
+| `sync_sporttv.py` | Sync Sport TV Portuguese audio (preshow intro sting + watermark break detection) |
 | `mux_and_split.py` | Final mux and smartcut-based split into individual races |
 
 ## Fingerprints
 All fingerprint WAV clips live in `fingerprints/`. See `memory/MEMORY.md` for a full list.
+
+## Reporting Conventions
+- Always report timestamps and durations in `hh:mm:ss` format (not raw seconds).
