@@ -21,6 +21,8 @@ from pathlib import Path
 from scipy.io import wavfile
 from scipy.signal import fftconvolve
 
+from audio_utils import get_audio_stream_count, extract_wav as _extract_wav
+
 # ── Tuning ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE       = 8000   # Hz for correlation audio - fast and more than sufficient
 NEEDLE_SECS       = 120    # seconds of needle for Moto2 search (sting + unique race audio)
@@ -28,15 +30,6 @@ MOTO2_SEARCH_SECS = 600    # search window after Moto3 end; gap1 is typically ~3
 
 
 # ── ffprobe helpers ───────────────────────────────────────────────────────────
-
-def ffprobe(f, select_streams, show_entries, fmt='default=noprint_wrappers=1:nokey=1'):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error',
-         '-select_streams', select_streams,
-         '-show_entries', show_entries,
-         '-of', fmt, f],
-        capture_output=True, text=True, check=True)
-    return r.stdout.strip()
 
 def get_duration(f):
     r = subprocess.run(
@@ -64,21 +57,6 @@ def get_audio_info(f, stream=0):
     s = json.loads(r.stdout)['streams'][0]
     return {'rate': s['sample_rate'], 'channels': s['channels'], 'codec': s['codec_name']}
 
-def count_audio_streams(f):
-    out = ffprobe(f, 'a', 'stream=index')
-    return len([l for l in out.splitlines() if l.strip()])
-
-
-# ── Audio extraction + correlation ────────────────────────────────────────────
-
-def extract_audio_wav(src, dst, stream=0, start=None, duration=None):
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-    if start    is not None: cmd += ['-ss', f'{start:.3f}']
-    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
-    cmd += ['-i', src, '-map', f'0:a:{stream}',
-            '-ar', str(SAMPLE_RATE), '-ac', '1', '-f', 'wav', dst]
-    subprocess.run(cmd, check=True)
-
 def find_offset(polsat, web_file, search_start, search_duration, label, web_ambient_stream=1):
     """
     Find where web_file's sting appears within polsat[search_start : search_start+search_duration].
@@ -98,9 +76,9 @@ def find_offset(polsat, web_file, search_start, search_duration, label, web_ambi
 
     # Clamp needle so it never exceeds the haystack (required for mode='valid')
     needle_secs = min(NEEDLE_SECS, search_duration - 0.5)
-    extract_audio_wav(web_file, needle_wav, stream=web_ambient_stream, duration=needle_secs)
-    extract_audio_wav(polsat, haystack_wav, stream=0,
-                      start=search_start, duration=search_duration)
+    _extract_wav(web_file, needle_wav, f'0:a:{web_ambient_stream}', duration=needle_secs)
+    _extract_wav(polsat, haystack_wav, '0:a:0',
+                 start=search_start, duration=search_duration)
 
     _, needle   = wavfile.read(needle_wav)
     _, haystack = wavfile.read(haystack_wav)
@@ -136,7 +114,7 @@ def make_gap(duration, ref_file, output):
     match ref_file so that the concat demuxer can join them with -c copy.
     """
     vi      = get_video_info(ref_file)
-    n_audio = count_audio_streams(ref_file)
+    n_audio = get_audio_stream_count(ref_file)
 
     lavfi_inputs = ['-f', 'lavfi', '-i',
                     f"color=black:size={vi['width']}x{vi['height']}:rate={vi['fps']}"]

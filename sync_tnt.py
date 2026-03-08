@@ -13,21 +13,17 @@ Sync anchor: 5s pre-race sting found in both TNT and web master.
              Moto2/MotoGP sting positions are reported but not used for time-warping.
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
+    (via audio_utils / sting_detection modules)
 
 Usage:
     python sync_tnt.py [--dry-run] <tnt_file> <web_master.mkv> <output_dir>
 """
 
-import subprocess, sys, os, numpy as np
+import sys
 from pathlib import Path
-from scipy.io import wavfile
-from scipy.signal import fftconvolve
 
-# ── Tuning ────────────────────────────────────────────────────────────────────
-SR              = 8000   # Hz for correlation
-CONF_THRESH     = 0.5    # minimum confidence to accept a transition hit
-SUPPRESS_SECS   = 30     # deduplicate transition hits within this window (seconds)
-MIN_EVENT_SECS  = 120    # ignore transition hits in the first 2 minutes (broadcast intro)
+from audio_utils import get_duration, extract_seg, concat_segments_to_mka
+from sting_detection import find_sting, find_all_transitions
 
 # Search window for Moto3 sting in web master (absolute)
 MOTO3_STING_SEARCH  = (600,  1200)   # (start, duration) - 10-30 min into web master
@@ -37,128 +33,11 @@ MOTO3_TO_MOTO2_SECS  = 4500   # 1h 15m
 MOTO2_TO_MOTOGP_SECS = 6240   # 1h 44m
 STING_SEARCH_MARGIN  = 60     # search +-60s around the expected time
 
+MAX_BREAK_SECS = 420  # 7 minutes - discard pairings longer than this
+
 # Fingerprints directory (alongside this script)
 FP_DIR = Path(__file__).parent / 'fingerprints'
 
-
-# ── ffprobe ───────────────────────────────────────────────────────────────────
-
-def get_duration(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return float(r.stdout.strip())
-
-
-# ── Audio extraction ──────────────────────────────────────────────────────────
-
-def extract_wav(src, dst, stream_spec, start=None, duration=None,
-                sr=SR, channels=1):
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-    if start    is not None: cmd += ['-ss', f'{start:.3f}']
-    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
-    cmd += ['-i', str(src), '-map', stream_spec,
-            '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
-    subprocess.run(cmd, check=True)
-
-def extract_seg(src, dst, stream_spec, start, duration):
-    """Extract a segment at 48 kHz stereo for final output concatenation."""
-    extract_wav(src, dst, stream_spec,
-                start=start, duration=duration, sr=48000, channels=2)
-
-
-# ── Correlation ───────────────────────────────────────────────────────────────
-
-def _peak(haystack, needle):
-    """Return (sample_index, confidence) for best match of needle in haystack."""
-    h = haystack.astype(np.float32)
-    n = needle.astype(np.float32)
-    if len(n) >= len(h):
-        n = n[:max(1, len(h) - 1)]
-    corr  = fftconvolve(h, n[::-1], mode='valid')
-    idx   = int(np.argmax(np.abs(corr)))
-    h_win = h[idx:idx + len(n)]
-    conf  = float(np.abs(corr[idx])) / (
-            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
-    return idx, conf
-
-
-def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
-               label=''):
-    """
-    Find a sting fingerprint within a time window of src.
-    Returns (absolute_time_sec, confidence).
-    """
-    tmp = '_tmp_sting.wav'
-    extract_wav(src, tmp, stream_spec, start=search_start, duration=search_dur)
-    _, needle   = wavfile.read(fp_path)
-    _, haystack = wavfile.read(tmp)
-    os.remove(tmp)
-    idx, conf = _peak(haystack, needle)
-    t = search_start + idx / SR
-    if label:
-        print(f'  {label}: {t:.3f}s ({t/60:.1f} min)  conf={conf:.4f}')
-    return t, conf
-
-
-def find_all_transitions(src, fp_paths, stream_spec='0:a:0'):
-    """
-    Scan src for all occurrences of one or more transition fingerprints.
-    fp_paths: str or list of str.
-    Returns a sorted list of (time_sec, confidence, clip_dur_sec).
-    Events before MIN_EVENT_SECS are discarded.
-    """
-    if isinstance(fp_paths, str):
-        fp_paths = [fp_paths]
-
-    tmp = '_tmp_full_scan.wav'
-    print('  Extracting full audio for transition scan...')
-    extract_wav(src, tmp, stream_spec)
-    _, h = wavfile.read(tmp)
-    os.remove(tmp)
-    h = h.astype(np.float32)
-
-    all_hits = []   # (time, confidence, clip_dur)
-
-    for fp_path in fp_paths:
-        _, needle = wavfile.read(fp_path)
-        needle    = needle.astype(np.float32)
-        clip_dur  = len(needle) / SR
-
-        corr  = fftconvolve(h, needle[::-1], mode='valid')
-        abs_c = np.abs(corr)
-        n_len = len(needle)
-        supp  = int(SUPPRESS_SECS * SR)
-        tmp_c = abs_c.copy()
-
-        while True:
-            idx  = int(np.argmax(tmp_c))
-            h_w  = h[idx:idx + n_len]
-            conf = float(abs_c[idx]) / (
-                   np.linalg.norm(h_w) * np.linalg.norm(needle) + 1e-10)
-            if conf < CONF_THRESH:
-                break
-            t = idx / SR
-            if t >= MIN_EVENT_SECS:
-                all_hits.append((t, conf, clip_dur))
-            lo = max(0, idx - supp)
-            hi = min(len(tmp_c), idx + supp)
-            tmp_c[lo:hi] = 0
-
-    # Merge and cross-fingerprint dedup: sort, suppress within SUPPRESS_SECS
-    all_hits.sort()
-    deduped = []
-    for t, c, d in all_hits:
-        if not deduped or t - deduped[-1][0] > SUPPRESS_SECS:
-            deduped.append((t, c, d))
-        elif c > deduped[-1][1]:
-            deduped[-1] = (t, c, d)   # keep higher-confidence hit in same window
-
-    return deduped
-
-
-MAX_BREAK_SECS = 420  # 7 minutes - discard pairings longer than this
 
 def pair_breaks(events):
     """
@@ -263,17 +142,7 @@ def build_and_concat(tnt, web_master, breaks,
         print(f'\n[DRY RUN] Would concatenate {len(segs)} segments -> {output_mka}')
         return
 
-    list_path = '_tmp_tnt_concat.txt'
-    with open(list_path, 'w') as f:
-        for s in segs:
-            f.write(f"file '{Path(s).resolve()}'\n")
-    print(f'\nConcatenating {len(segs)} segments -> {output_mka}')
-    subprocess.run(
-        ['ffmpeg', '-y', '-hide_banner',
-         '-f', 'concat', '-safe', '0', '-i', list_path,
-         '-map', '0', '-c:a', 'aac', '-b:a', '192k', str(output_mka)],
-        check=True)
-    os.remove(list_path)
+    concat_segments_to_mka(segs, output_mka, list_path_prefix='_tmp_tnt')
 
     for f in tmp_dir.iterdir():
         f.unlink()
@@ -320,7 +189,6 @@ def main():
           f'Web master: {d_web:.1f}s ({d_web/3600:.2f}h)')
 
     # ── Find pre-race sting positions in web master (Natural Sounds track) ──
-    # This auto-detects per-round positions rather than hardcoding them.
     print('\nLocating pre-race stings in web master...')
     m3_master, _ = find_sting(web_master, fp_sting,
                                *MOTO3_STING_SEARCH, stream_spec='0:a:1',

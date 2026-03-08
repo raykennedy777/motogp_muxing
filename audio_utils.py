@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""
+audio_utils.py
+Shared audio extraction, correlation, and concatenation utilities
+for MotoGP sync scripts.
+"""
+
+import subprocess, os, numpy as np
+from pathlib import Path
+from scipy.io import wavfile
+from scipy.signal import fftconvolve
+
+SR = 8000   # Hz for correlation
+
+
+def get_duration(f):
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
+        capture_output=True, text=True, check=True)
+    return float(r.stdout.strip())
+
+
+def get_audio_stream_count(f):
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'a',
+         '-show_entries', 'stream=index',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
+        capture_output=True, text=True, check=True)
+    return len([l for l in r.stdout.strip().splitlines() if l.strip()])
+
+
+def extract_wav(src, dst, stream_spec, start=None, duration=None,
+                sr=SR, channels=1):
+    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
+    if start    is not None: cmd += ['-ss', f'{start:.3f}']
+    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
+    cmd += ['-i', str(src), '-map', stream_spec,
+            '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
+    subprocess.run(cmd, check=True)
+
+
+def extract_seg(src, dst, stream_spec, start, duration):
+    """Extract a segment at 48 kHz stereo for final output concatenation."""
+    extract_wav(src, dst, stream_spec,
+                start=start, duration=duration, sr=48000, channels=2)
+
+
+def load_fp_wav(path, sr=SR):
+    """
+    Load fingerprint audio from any format (WAV, MKA, etc.) at sr Hz mono.
+    Returns a float32 numpy array.
+    """
+    p = Path(path)
+    if p.suffix.lower() == '.wav':
+        _, data = wavfile.read(str(p))
+        return data.astype(np.float32)
+    tmp = f'_tmp_fp_{p.stem}.wav'
+    extract_wav(str(p), tmp, '0:a:0', sr=sr)
+    _, data = wavfile.read(tmp)
+    os.remove(tmp)
+    return data.astype(np.float32)
+
+
+def _peak(haystack, needle):
+    """Return (sample_index, confidence) for best match of needle in haystack."""
+    h = haystack.astype(np.float32)
+    n = needle.astype(np.float32)
+    if len(n) >= len(h):
+        n = n[:max(1, len(h) - 1)]
+    corr  = fftconvolve(h, n[::-1], mode='valid')
+    idx   = int(np.argmax(np.abs(corr)))
+    h_win = h[idx:idx + len(n)]
+    conf  = float(np.abs(corr[idx])) / (
+            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
+    return idx, conf
+
+
+def concat_segments_to_mka(seg_paths, output_mka, list_path_prefix='_tmp'):
+    """Write a concat list, run ffmpeg AAC encode, then remove the list file."""
+    list_path = f'{list_path_prefix}_concat.txt'
+    with open(list_path, 'w') as f:
+        for s in seg_paths:
+            f.write(f"file '{Path(s).resolve()}'\n")
+    print(f'\nConcatenating {len(seg_paths)} segments -> {output_mka}')
+    subprocess.run(
+        ['ffmpeg', '-y', '-hide_banner',
+         '-f', 'concat', '-safe', '0', '-i', list_path,
+         '-map', '0', '-c:a', 'aac', '-b:a', '192k', str(output_mka)],
+        check=True)
+    os.remove(list_path)

@@ -15,19 +15,18 @@ Output structure:
   3. Natural Sounds from master, master_time(d_rts - trim_end) to master end
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
+    (via audio_utils / sting_detection modules)
 
 Usage:
     python sync_rts.py [--dry-run] [--trim-start S] [--trim-end S]
                        <rts_file> <master.mkv> <output_dir>
 """
 
-import subprocess, sys, os, argparse, numpy as np
+import sys, argparse
 from pathlib import Path
-from scipy.io import wavfile
-from scipy.signal import fftconvolve
 
-# ── Tuning ─────────────────────────────────────────────────────────────────────
-SR = 8000  # Hz for correlation
+from audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
+from sting_detection import find_sting
 
 # Search window for the 65s pre-race sting (start_sec, duration_sec)
 STING_SEARCH_MASTER = (0, 3600)   # first 60 min of master
@@ -35,79 +34,6 @@ STING_SEARCH_SRC    = (0, 3600)   # first 60 min of source (covers all RTS files
 
 # Fingerprints directory (alongside this script)
 FP_DIR = Path(__file__).parent / 'fingerprints'
-
-
-# ── ffprobe ────────────────────────────────────────────────────────────────────
-
-def get_duration(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return float(r.stdout.strip())
-
-
-def get_audio_stream_count(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-select_streams', 'a',
-         '-show_entries', 'stream=index',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return len([l for l in r.stdout.strip().splitlines() if l.strip()])
-
-
-# ── Audio extraction ───────────────────────────────────────────────────────────
-
-def extract_wav(src, dst, stream_spec, start=None, duration=None,
-                sr=SR, channels=1):
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-    if start    is not None: cmd += ['-ss', f'{start:.3f}']
-    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
-    cmd += ['-i', str(src), '-map', stream_spec,
-            '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
-    subprocess.run(cmd, check=True)
-
-
-def extract_seg(src, dst, stream_spec, start, duration):
-    """Extract a segment at 48000 Hz stereo for final output concatenation."""
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-           '-ss', f'{start:.3f}', '-t', f'{duration:.3f}',
-           '-i', str(src), '-map', stream_spec,
-           '-ar', '48000', '-ac', '2', '-f', 'wav', str(dst)]
-    subprocess.run(cmd, check=True)
-
-
-# ── Correlation ────────────────────────────────────────────────────────────────
-
-def _peak(haystack, needle):
-    h = haystack.astype(np.float32)
-    n = needle.astype(np.float32)
-    if len(n) >= len(h):
-        n = n[:max(1, len(h) - 1)]
-    corr  = fftconvolve(h, n[::-1], mode='valid')
-    idx   = int(np.argmax(np.abs(corr)))
-    h_win = h[idx:idx + len(n)]
-    conf  = float(np.abs(corr[idx])) / (
-            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
-    return idx, conf
-
-
-def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
-               label=''):
-    """Find a sting fingerprint within a time window. Returns (time_sec, conf)."""
-    tmp = '_tmp_rts_sting.wav'
-    actual_dur = min(search_dur, get_duration(src) - search_start)
-    if actual_dur <= 0:
-        return search_start, 0.0
-    extract_wav(src, tmp, stream_spec, start=search_start, duration=actual_dur)
-    _, needle   = wavfile.read(fp_path)
-    _, haystack = wavfile.read(tmp)
-    os.remove(tmp)
-    idx, conf = _peak(haystack, needle)
-    t = search_start + idx / SR
-    if label:
-        print(f'  {label}: {t:.3f}s ({t/60:.2f} min)  conf={conf:.4f}')
-    return t, conf
 
 
 # ── Segment building and concatenation ────────────────────────────────────────
@@ -180,17 +106,7 @@ def build_and_concat(src_file, master_file, src_sting, master_sting,
         print(f'\n[DRY RUN] Would concatenate {len(segs)} segments -> {output_mka}')
         return
 
-    list_path = '_tmp_rts_concat.txt'
-    with open(list_path, 'w') as f:
-        for s in segs:
-            f.write(f"file '{Path(s).resolve()}'\n")
-    print(f'\nConcatenating {len(segs)} segments -> {output_mka}')
-    subprocess.run(
-        ['ffmpeg', '-y', '-hide_banner',
-         '-f', 'concat', '-safe', '0', '-i', list_path,
-         '-map', '0', '-c:a', 'aac', '-b:a', '192k', str(output_mka)],
-        check=True)
-    os.remove(list_path)
+    concat_segments_to_mka(segs, output_mka, list_path_prefix='_tmp_rts')
 
     for f in tmp_dir.iterdir():
         f.unlink()

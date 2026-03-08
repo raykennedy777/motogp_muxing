@@ -13,18 +13,17 @@ files to determine the offset, then build a single audio track:
 The output is a single MKA file suitable for manual sync checking.
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
+    (via audio_utils / sting_detection modules)
 
 Usage:
     python sync_sky.py [--dry-run] <sky_file> <master.mkv> <output_dir>
 """
 
-import subprocess, sys, os, numpy as np
+import sys
 from pathlib import Path
-from scipy.io import wavfile
-from scipy.signal import fftconvolve
 
-# ── Tuning ─────────────────────────────────────────────────────────────────────
-SR = 8000  # Hz for correlation
+from audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
+from sting_detection import find_sting
 
 # Search window for the 65s pre-race sting in each file
 STING_SEARCH_MASTER = (0, 3600)   # first 60 min of master
@@ -32,77 +31,6 @@ STING_SEARCH_SKY    = (0, 180)    # first 3 min of Sky file
 
 # Fingerprints directory (alongside this script)
 FP_DIR = Path(__file__).parent / 'fingerprints'
-
-
-# ── ffprobe ────────────────────────────────────────────────────────────────────
-
-def get_duration(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return float(r.stdout.strip())
-
-
-def get_audio_stream_count(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-select_streams', 'a',
-         '-show_entries', 'stream=index',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return len([l for l in r.stdout.strip().splitlines() if l.strip()])
-
-
-# ── Audio extraction ───────────────────────────────────────────────────────────
-
-def extract_wav(src, dst, stream_spec, start=None, duration=None,
-                sr=SR, channels=1):
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-    if start    is not None: cmd += ['-ss', f'{start:.3f}']
-    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
-    cmd += ['-i', str(src), '-map', stream_spec,
-            '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
-    subprocess.run(cmd, check=True)
-
-
-def extract_seg(src, dst, stream_spec, start, duration):
-    """Extract a segment at 48 kHz stereo for final output concatenation."""
-    extract_wav(src, dst, stream_spec,
-                start=start, duration=duration, sr=48000, channels=2)
-
-
-# ── Correlation ────────────────────────────────────────────────────────────────
-
-def _peak(haystack, needle):
-    """Return (sample_index, confidence) for best match of needle in haystack."""
-    h = haystack.astype(np.float32)
-    n = needle.astype(np.float32)
-    if len(n) >= len(h):
-        n = n[:max(1, len(h) - 1)]
-    corr  = fftconvolve(h, n[::-1], mode='valid')
-    idx   = int(np.argmax(np.abs(corr)))
-    h_win = h[idx:idx + len(n)]
-    conf  = float(np.abs(corr[idx])) / (
-            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
-    return idx, conf
-
-
-def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
-               label=''):
-    """
-    Find a sting fingerprint within a time window of src.
-    Returns (absolute_time_sec, confidence).
-    """
-    tmp = '_tmp_sky_sting.wav'
-    extract_wav(src, tmp, stream_spec, start=search_start, duration=search_dur)
-    _, needle   = wavfile.read(fp_path)
-    _, haystack = wavfile.read(tmp)
-    os.remove(tmp)
-    idx, conf = _peak(haystack, needle)
-    t = search_start + idx / SR
-    if label:
-        print(f'  {label}: {t:.3f}s ({t/60:.2f} min)  conf={conf:.4f}')
-    return t, conf
 
 
 # ── Segment building and concatenation ────────────────────────────────────────
@@ -171,17 +99,7 @@ def build_and_concat(sky_file, master_file, sky_sting, master_sting,
         print(f'\n[DRY RUN] Would concatenate {len(segs)} segments -> {output_mka}')
         return
 
-    list_path = '_tmp_sky_concat.txt'
-    with open(list_path, 'w') as f:
-        for s in segs:
-            f.write(f"file '{Path(s).resolve()}'\n")
-    print(f'\nConcatenating {len(segs)} segments -> {output_mka}')
-    subprocess.run(
-        ['ffmpeg', '-y', '-hide_banner',
-         '-f', 'concat', '-safe', '0', '-i', list_path,
-         '-map', '0', '-c:a', 'aac', '-b:a', '192k', str(output_mka)],
-        check=True)
-    os.remove(list_path)
+    concat_segments_to_mka(segs, output_mka, list_path_prefix='_tmp_sky')
 
     for f in tmp_dir.iterdir():
         f.unlink()

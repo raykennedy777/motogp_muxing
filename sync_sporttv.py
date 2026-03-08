@@ -20,21 +20,19 @@ Break-end detection hierarchy:
 Sync anchor: prerace_sting.wav (Moto3 start sting) found in both Sport TV and web master.
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
+    (via audio_utils / sting_detection / watermark_detection modules)
 
 Usage:
     python sync_sporttv.py [--dry-run] <sporttv_file> <web_master.mkv> <output_dir>
 """
 
-import subprocess, sys, os, numpy as np
+import sys, os
 from pathlib import Path
 from scipy.io import wavfile
-from scipy.signal import fftconvolve
 
-# ── Tuning ────────────────────────────────────────────────────────────────────
-SR              = 8000   # Hz for correlation
-CONF_THRESH     = 0.5    # minimum confidence to accept a hit
-SUPPRESS_SECS   = 30     # deduplicate transition hits within this window
-MIN_EVENT_SECS  = 120    # ignore transition hits in the first 2 minutes
+from audio_utils import SR, get_duration, extract_wav, extract_seg, load_fp_wav, _peak, concat_segments_to_mka
+from sting_detection import CONF_THRESH, find_sting, find_all_transitions
+from watermark_detection import build_watermark_template, find_break_end_via_watermark
 
 # Search window for Moto3 sting in web master (absolute)
 MOTO3_STING_SEARCH    = (600, 1200)   # 10-30 min into web master
@@ -71,217 +69,6 @@ WM_FPS              = 2     # frames per second to sample during break-end scan
 
 # Fingerprints directory (alongside this script)
 FP_DIR = Path(__file__).parent / 'fingerprints'
-
-
-# ── ffprobe ───────────────────────────────────────────────────────────────────
-
-def get_duration(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return float(r.stdout.strip())
-
-
-# ── Audio extraction ──────────────────────────────────────────────────────────
-
-def extract_wav(src, dst, stream_spec, start=None, duration=None,
-                sr=SR, channels=1):
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-    if start    is not None: cmd += ['-ss', f'{start:.3f}']
-    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
-    cmd += ['-i', str(src), '-map', stream_spec,
-            '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
-    subprocess.run(cmd, check=True)
-
-
-def extract_seg(src, dst, stream_spec, start, duration):
-    """Extract a segment at 48 kHz stereo for final output concatenation."""
-    extract_wav(src, dst, stream_spec,
-                start=start, duration=duration, sr=48000, channels=2)
-
-
-def load_fp_wav(path):
-    """
-    Load fingerprint audio from any format (WAV, MKA, etc.) at SR Hz mono.
-    Returns a float32 numpy array.
-    """
-    p = Path(path)
-    if p.suffix.lower() == '.wav':
-        _, data = wavfile.read(str(p))
-        return data.astype(np.float32)
-    tmp = f'_tmp_sporttv_fp_{p.stem}.wav'
-    extract_wav(str(p), tmp, '0:a:0')
-    _, data = wavfile.read(tmp)
-    os.remove(tmp)
-    return data.astype(np.float32)
-
-
-# ── Correlation ───────────────────────────────────────────────────────────────
-
-def _peak(haystack, needle):
-    """Return (sample_index, confidence) for best match of needle in haystack."""
-    h = haystack.astype(np.float32)
-    n = needle.astype(np.float32)
-    if len(n) >= len(h):
-        n = n[:max(1, len(h) - 1)]
-    corr  = fftconvolve(h, n[::-1], mode='valid')
-    idx   = int(np.argmax(np.abs(corr)))
-    h_win = h[idx:idx + len(n)]
-    conf  = float(np.abs(corr[idx])) / (
-            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
-    return idx, conf
-
-
-def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
-               label=''):
-    """
-    Find a sting fingerprint within a time window of src.
-    Returns (absolute_time_sec, confidence).
-    """
-    tmp = '_tmp_sporttv_sting.wav'
-    extract_wav(src, tmp, stream_spec, start=search_start, duration=search_dur)
-    needle      = load_fp_wav(fp_path)
-    _, haystack = wavfile.read(tmp)
-    os.remove(tmp)
-    idx, conf = _peak(haystack, needle)
-    t = search_start + idx / SR
-    if label:
-        print(f'  {label}: {t:.3f}s ({t/3600:.2f}h)  conf={conf:.4f}')
-    return t, conf
-
-
-def find_all_transitions(src, fp_paths, stream_spec='0:a:0'):
-    """
-    Scan src for all occurrences of one or more transition fingerprints.
-    fp_paths: str or list of str/Path.
-    Returns a sorted list of (time_sec, confidence, clip_dur_sec).
-    Events before MIN_EVENT_SECS are discarded.
-    """
-    if isinstance(fp_paths, (str, Path)):
-        fp_paths = [fp_paths]
-
-    tmp = '_tmp_sporttv_scan.wav'
-    print('  Extracting full audio for transition scan...')
-    extract_wav(src, tmp, stream_spec)
-    _, h = wavfile.read(tmp)
-    os.remove(tmp)
-    h = h.astype(np.float32)
-
-    all_hits = []
-
-    for fp_path in fp_paths:
-        needle   = load_fp_wav(fp_path)
-        clip_dur = len(needle) / SR
-
-        corr  = fftconvolve(h, needle[::-1], mode='valid')
-        abs_c = np.abs(corr)
-        n_len = len(needle)
-        supp  = int(SUPPRESS_SECS * SR)
-        tmp_c = abs_c.copy()
-
-        while True:
-            idx  = int(np.argmax(tmp_c))
-            h_w  = h[idx:idx + n_len]
-            conf = float(abs_c[idx]) / (
-                   np.linalg.norm(h_w) * np.linalg.norm(needle) + 1e-10)
-            if conf < CONF_THRESH:
-                break
-            t = idx / SR
-            if t >= MIN_EVENT_SECS:
-                all_hits.append((t, conf, clip_dur))
-            lo = max(0, idx - supp)
-            hi = min(len(tmp_c), idx + supp)
-            tmp_c[lo:hi] = 0
-
-    # Merge and cross-fingerprint dedup: sort, suppress within SUPPRESS_SECS
-    all_hits.sort()
-    deduped = []
-    for t, c, d in all_hits:
-        if not deduped or t - deduped[-1][0] > SUPPRESS_SECS:
-            deduped.append((t, c, d))
-        elif c > deduped[-1][1]:
-            deduped[-1] = (t, c, d)
-
-    return deduped
-
-
-# ── Video watermark detection ─────────────────────────────────────────────────
-
-def build_watermark_template(sporttv, ref_time):
-    """
-    Extract the Sport TV watermark reference template from a single frame at ref_time.
-    ref_time must be during confirmed live on-track coverage (watermark present).
-    Returns float32 array of WM_OUT_W*WM_OUT_H pixels, or None on failure.
-    """
-    tmp = '_tmp_sporttv_wm_template.raw'
-    try:
-        subprocess.run(
-            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-             '-ss', f'{ref_time:.3f}', '-i', str(sporttv), '-frames:v', '1',
-             '-vf', f'crop={WM_W}:{WM_H}:{WM_X}:{WM_Y},scale={WM_OUT_W}:{WM_OUT_H}',
-             '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
-            check=True)
-        arr = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
-        os.remove(tmp)
-    except Exception as e:
-        print(f'  WARNING: Could not extract watermark template: {e}')
-        if os.path.exists(tmp): os.remove(tmp)
-        return None
-    n = WM_OUT_W * WM_OUT_H
-    return arr[:n] if len(arr) >= n else None
-
-
-def find_break_end_via_watermark(sporttv, break_start, clip_dur, wm_template):
-    """
-    Detect break end by scanning for the Sport TV watermark returning in live video.
-    Returns (break_end_sec, found_bool).
-    break_end = first frame where watermark detected - 4s.
-    """
-    search_start = break_start + clip_dur
-    tmp = '_tmp_sporttv_wm_probe.raw'
-    try:
-        subprocess.run(
-            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-             '-ss', f'{search_start:.3f}', '-t', f'{WM_SEARCH_SECS:.0f}',
-             '-i', str(sporttv),
-             '-vf', (f'fps={WM_FPS},'
-                     f'crop={WM_W}:{WM_H}:{WM_X}:{WM_Y},'
-                     f'scale={WM_OUT_W}:{WM_OUT_H}'),
-             '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
-            check=True)
-        frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
-        os.remove(tmp)
-    except Exception as e:
-        print(f'  WARNING: Watermark probe failed at break {break_start:.1f}s: {e}')
-        if os.path.exists(tmp): os.remove(tmp)
-        return None, False
-
-    n_pixels = WM_OUT_W * WM_OUT_H
-    n_frames  = len(frames) // n_pixels
-    step      = 1.0 / WM_FPS
-    t0        = wm_template - wm_template.mean()
-    t0_norm   = np.linalg.norm(t0)
-    min_frame = int(WM_MIN_OFFSET_SECS / step)
-
-    max_conf   = 0.0
-    max_conf_t = search_start
-    for i in range(n_frames):
-        frame = frames[i * n_pixels:(i + 1) * n_pixels]
-        f0    = frame - frame.mean()
-        conf  = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
-        t_i   = search_start + i * step
-        if conf > max_conf:
-            max_conf   = conf
-            max_conf_t = t_i
-        if i >= min_frame and conf > WM_THRESH:
-            print(f'    Watermark conf={conf:.3f} at +{i*step:.1f}s '
-                  f'(t={t_i:.1f}s); break end = {t_i - 4.0:.1f}s')
-            return t_i - 4.0, True
-
-    print(f'    Watermark not found (max={max_conf:.3f} at t={max_conf_t:.1f}s, '
-          f'+{max_conf_t - search_start:.0f}s from search start)')
-    return None, False
 
 
 # ── Show-start and break-end detection ────────────────────────────────────────
@@ -327,7 +114,7 @@ def find_break_end_via_return_stings(sporttv, fp_return_list, fp_content_list,
     extract_wav(sporttv, tmp, '0:a:0', start=search_start, duration=BREAKEND_SEARCH_SECS)
     _, h = wavfile.read(tmp)
     os.remove(tmp)
-    h = h.astype(np.float32)
+    h = h.astype(float)
 
     candidates = []
     for fp_path, add_dur in ([(p, True)  for p in fp_return_list] +
@@ -387,7 +174,11 @@ def detect_breaks_sporttv(sporttv, fp_leadin_list, fp_return_list=None,
 
         if not found and wm_template is not None:
             end, found = find_break_end_via_watermark(
-                sporttv, t, clip_dur, wm_template)
+                sporttv, t, clip_dur, wm_template,
+                WM_X, WM_Y, WM_W, WM_H,
+                WM_OUT_W, WM_OUT_H,
+                search_secs=WM_SEARCH_SECS, fps=WM_FPS,
+                thresh=WM_THRESH, min_offset_secs=WM_MIN_OFFSET_SECS)
             if found:
                 print(f'    Watermark detected: break at {t:.1f}s ends at {end:.1f}s')
 
@@ -509,17 +300,7 @@ def build_and_concat(sporttv, web_master, breaks, show_start_sporttv,
         print(f'\n[DRY RUN] Would concatenate {len(segs)} segments -> {output_mka}')
         return
 
-    list_path = '_tmp_sporttv_concat.txt'
-    with open(list_path, 'w') as f:
-        for s in segs:
-            f.write(f"file '{Path(s).resolve()}'\n")
-    print(f'\nConcatenating {len(segs)} segments -> {output_mka}')
-    subprocess.run(
-        ['ffmpeg', '-y', '-hide_banner',
-         '-f', 'concat', '-safe', '0', '-i', list_path,
-         '-map', '0', '-c:a', 'aac', '-b:a', '192k', str(output_mka)],
-        check=True)
-    os.remove(list_path)
+    concat_segments_to_mka(segs, output_mka, list_path_prefix='_tmp_sporttv')
 
     for f in tmp_dir.iterdir():
         f.unlink()
@@ -629,7 +410,9 @@ def main():
     wm_template = None
     try:
         wm_ref = m3_sporttv + 300   # 5 min into Moto3 — confirmed live coverage
-        wm_template = build_watermark_template(sporttv_file, wm_ref)
+        wm_template = build_watermark_template(
+            sporttv_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H,
+            tmp_suffix='_sporttv')
         if wm_template is not None:
             print(f'  Template at {wm_ref:.0f}s  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
         else:
