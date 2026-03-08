@@ -15,22 +15,20 @@ Usage:
         [--keep-combined] [--dry-run]
 """
 
-import argparse, gc, json, os, subprocess, sys
+import argparse, gc, json, subprocess, sys
 from pathlib import Path
 import numpy as np
-from scipy.io import wavfile
-from scipy.signal import fftconvolve
 
-# ── Constants (shared with sync_tnt.py) ──────────────────────────────────────
-SR                   = 8000   # Hz for correlation
+from audio_utils import get_duration, extract_wav
+from sting_detection import CONF_THRESH, find_sting
+
+# ── Constants ─────────────────────────────────────────────────────────────────
 MOTO3_STING_SEARCH   = (600, 1200)   # (start_s, dur_s) — 10-30 min
 MOTO3_TO_MOTO2_SECS  = 4500          # ~1h15m between race stings
 MOTO2_TO_MOTOGP_SECS = 6240          # ~1h44m between race stings
 STING_SEARCH_MARGIN  = 60            # ±60 s around expected sting time
-CONF_THRESH          = 0.5           # minimum correlation confidence
 
 # WEB-DL reference durations (fallback when files not available)
-
 MOTO3_WEBDL_DUR      = 4413.800   # seconds
 MOTO2_WEBDL_DUR      = 4961.000
 MOTOGP_WEBDL_DUR     = 6491.060
@@ -47,25 +45,29 @@ VIDEO_MATCH_H       = 72     # downsample height
 VIDEO_SEARCH_MARGIN = 2.0    # ±seconds to search around audio estimate
 VIDEO_MIN_QUALITY   = 0.3    # minimum normalised-SSD quality to accept
 
-CALENDAR = {
-     1: 'Thailand',        2: 'Brazil',          3: 'USA',           4: 'Qatar',
-     5: 'Spain.Jerez',     6: 'France',           7: 'Spain.Catalunya', 8: 'Italy',
-     9: 'Hungary',        10: 'Czechia',          11: 'Netherlands',  12: 'Germany',
-    13: 'Britain',        14: 'Spain.Aragon',     15: 'SanMarino',    16: 'Austria',
-    17: 'Japan',          18: 'Indonesia',        19: 'Australia',    20: 'Malaysia',
-    21: 'Portugal',       22: 'Spain.Valencia',
+CALENDARS = {
+    2026: {
+         1: 'Thailand',        2: 'Brazil',          3: 'USA',           4: 'Qatar',
+         5: 'Spain.Jerez',     6: 'France',           7: 'Spain.Catalunya', 8: 'Italy',
+         9: 'Hungary',        10: 'Czechia',          11: 'Netherlands',  12: 'Germany',
+        13: 'Britain',        14: 'Spain.Aragon',     15: 'SanMarino',    16: 'Austria',
+        17: 'Japan',          18: 'Indonesia',        19: 'Australia',    20: 'Malaysia',
+        21: 'Portugal',       22: 'Spain.Valencia',
+    },
+    # 2025: rounds 16-22 confirmed from broadcast files.
+    # Rounds 1-15 are approximate — verify and correct for any round you process.
+    2025: {
+         1: 'Thailand',        2: 'Argentina',        3: 'USA',           4: 'Spain.Jerez',
+         5: 'France',          6: 'Italy',             7: 'Spain.Catalunya', 8: 'Germany',
+         9: 'Netherlands',    10: 'Britain',           11: 'Austria',      12: 'Czechia',
+        13: 'Spain.Aragon',   14: 'Hungary',           15: 'Emilia-Romagna', 16: 'SanMarino',
+        17: 'Japan',          18: 'Indonesia',        19: 'Australia',    20: 'Malaysia',
+        21: 'Portugal',       22: 'Spain.Valencia',
+    },
 }
 
 
 # ── ffprobe helpers ───────────────────────────────────────────────────────────
-
-def get_duration(f):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(f)],
-        capture_output=True, text=True, check=True)
-    return float(r.stdout.strip())
-
 
 def get_frame_count(f):
     """
@@ -88,53 +90,6 @@ def get_frame_count(f):
         '-of', 'default=noprint_wrappers=1:nokey=1', str(f),
     ], capture_output=True, text=True, check=True)
     return int(r.stdout.strip())
-
-
-
-# ── Audio extraction (verbatim from sync_tnt.py) ─────────────────────────────
-
-def extract_wav(src, dst, stream_spec, start=None, duration=None,
-                sr=SR, channels=1):
-    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
-    if start    is not None: cmd += ['-ss', f'{start:.3f}']
-    if duration is not None: cmd += ['-t',  f'{duration:.3f}']
-    cmd += ['-i', str(src), '-map', stream_spec,
-            '-ar', str(sr), '-ac', str(channels), '-f', 'wav', str(dst)]
-    subprocess.run(cmd, check=True)
-
-
-# ── Correlation (verbatim from sync_tnt.py) ───────────────────────────────────
-
-def _peak(haystack, needle):
-    """Return (sample_index, confidence) for best match of needle in haystack."""
-    h = haystack.astype(np.float32)
-    n = needle.astype(np.float32)
-    if len(n) >= len(h):
-        n = n[:max(1, len(h) - 1)]
-    corr  = fftconvolve(h, n[::-1], mode='valid')
-    idx   = int(np.argmax(np.abs(corr)))
-    h_win = h[idx:idx + len(n)]
-    conf  = float(np.abs(corr[idx])) / (
-            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
-    return idx, conf
-
-
-def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
-               label=''):
-    """
-    Find a sting fingerprint within a time window of src.
-    Returns (absolute_time_sec, confidence).
-    """
-    tmp = '_tmp_sting.wav'
-    extract_wav(src, tmp, stream_spec, start=search_start, duration=search_dur)
-    _, needle   = wavfile.read(fp_path)
-    _, haystack = wavfile.read(tmp)
-    os.remove(tmp)
-    idx, conf = _peak(haystack, needle)
-    t = search_start + idx / SR
-    if label:
-        print(f'  {label}: {t:.3f}s ({t/60:.1f} min)  conf={conf:.4f}')
-    return t, conf
 
 
 # ── Video frame matching ─────────────────────────────────────────────────────
@@ -423,11 +378,16 @@ def mux_combined(polsat_master, web_master, tnt_mka, dazn_mka, output):
 
 # ── Phase 3: Frame-accurate splitting ────────────────────────────────────────
 
-def smart_cut(src, output, t_start, webdl_dur, codec_str):
+def smart_cut(src, output, t_start, webdl_dur, codec_str, exclude_audio=None):
     """
     Extract [t_start, t_start + webdl_dur] from src using the smartcut library.
     smartcut re-encodes only the partial GOPs at cut boundaries; everything
     else is stream-copied.  codec_str is 'x264' or 'x265' (from mux_combined).
+
+    exclude_audio: optional list of 0-based audio track indices to drop from the
+    output file (e.g. [1, 3] drops TNT and Polsat from a 5-track combined master).
+    smartcut always cuts with all tracks; excluded tracks are stripped afterwards
+    by a fast mkvmerge remux.
     """
     from fractions import Fraction
     from smartcut.media_container import MediaContainer
@@ -436,7 +396,10 @@ def smart_cut(src, output, t_start, webdl_dur, codec_str):
     from smartcut.misc_data import AudioExportSettings, AudioExportInfo
 
     t_end = t_start + webdl_dur
-    print(f'  smartcut: {t_start:.3f}s – {t_end:.3f}s  ({webdl_dur:.3f}s)')
+    print(f'  smartcut: {t_start:.3f}s - {t_end:.3f}s  ({webdl_dur:.3f}s)')
+
+    exclude_set = set(exclude_audio or [])
+    sc_output   = output.parent / ('_sc_tmp_' + output.name) if exclude_set else output
 
     container = MediaContainer(str(src))
     segments  = [(Fraction(t_start), Fraction(t_end))]
@@ -456,12 +419,37 @@ def smart_cut(src, output, t_start, webdl_dur, codec_str):
     exc = _sc(
         media_container=container,
         positive_segments=segments,
-        out_path=str(output),
+        out_path=str(sc_output),
         audio_export_info=aud_info,
         video_settings=vid_set,
     )
     if exc is not None:
         raise exc
+
+    if exclude_set:
+        # mkvmerge --audio-tracks uses absolute track IDs (as shown by mkvmerge -i),
+        # not 0-based audio-type indices. Query the actual IDs from the file.
+        _, audio_tracks = identify_tracks(sc_output)
+        keep_ids = [t['id'] for i, t in enumerate(audio_tracks) if i not in exclude_set]
+        excl_ids = [t['id'] for i, t in enumerate(audio_tracks) if i in exclude_set]
+        keep_str = ','.join(str(i) for i in keep_ids)
+        print(f'  Dropping audio idx {sorted(exclude_set)} (absolute IDs {excl_ids}); '
+              f'keeping absolute IDs {keep_ids} -> {output.name}')
+        subprocess.run(
+            ['mkvmerge', '-o', str(output),
+             '--audio-tracks', keep_str, str(sc_output)],
+            check=True)
+        sc_output.unlink()
+
+    # Fix DefaultDuration: smartcut's partial-GOP re-encoder can write incorrect
+    # fps into the H.264 SPS, causing tools like TMPGenc to misread the frame rate.
+    # mkvpropedit patches the MKV track header without touching the video bitstream.
+    dur_ns = round(1_000_000_000 / FPS)
+    subprocess.run(
+        ['mkvpropedit', str(output),
+         '--edit', 'track:v1',
+         '--set', f'default-duration={dur_ns}'],
+        check=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -469,9 +457,9 @@ def smart_cut(src, output, t_start, webdl_dur, codec_str):
 def main():
     ap = argparse.ArgumentParser(
         description='Mux + split MotoGP 2026 Sunday broadcast into race MKVs.')
-    ap.add_argument('--round',         type=int, required=True, metavar='N',
+    ap.add_argument('--round',         type=int, required=False, metavar='N',
                     help='Round number 1–22')
-    ap.add_argument('--session',       required=True, choices=['Race', 'Sprint'])
+    ap.add_argument('--session',       required=False, choices=['Race', 'Sprint'])
     ap.add_argument('--wip-dir',       required=True, metavar='DIR',
                     help='Directory with polsat_master, web_master, synced MKAs')
     ap.add_argument('--downloads-dir', metavar='DIR',
@@ -486,23 +474,16 @@ def main():
                     help='Broadcast year for output filenames (default: 2025)')
     ap.add_argument('--dry-run',         action='store_true',
                     help='Detect split points and print plan; no files written')
+    ap.add_argument('--mux-only',        action='store_true',
+                    help='Mux combined_master.mkv only; skip detection and splitting')
+    ap.add_argument('--exclude-audio',   type=int, nargs='+', metavar='N',
+                    help='0-based audio track indices to drop from split output files '
+                         '(e.g. --exclude-audio 1 3 drops tracks 1 and 3; '
+                         'does not affect combined_master.mkv)')
     args = ap.parse_args()
 
-    wip_dir   = Path(args.wip_dir)
-    out_dir   = Path(args.output_dir) if args.output_dir else wip_dir
-    round_num = args.round
-    session   = args.session
-    country   = CALENDAR.get(round_num)
-    if not country:
-        sys.exit(f'ERROR: Round {round_num} not in calendar (valid: 1–22)')
-    round_str = f'{round_num:02d}'
-
-    # ── Fingerprint check ──
-    fp_sting    = FP_DIR / 'prerace_sting.wav'
-    fp_sting_gp = FP_DIR / 'prerace_sting_motogp.wav'
-    for fp in (fp_sting, fp_sting_gp):
-        if not fp.exists():
-            sys.exit(f'ERROR: Missing fingerprint: {fp}')
+    wip_dir = Path(args.wip_dir)
+    out_dir = Path(args.output_dir) if args.output_dir else wip_dir
 
     # ── Auto-detect source files ──
     polsat_master = find_file(wip_dir,
@@ -517,6 +498,41 @@ def main():
     dazn_mka      = find_file(wip_dir,
                               'dazn_*_synced.mka', '*dazn*synced*.mka',
                               '*dazn*.mka')
+
+    # ── --mux-only: skip detection and splitting, just produce combined_master.mkv ──
+    if args.mux_only:
+        for label, f in (('polsat_master', polsat_master), ('web_master', web_master),
+                         ('tnt_mka', tnt_mka), ('dazn_mka', dazn_mka)):
+            if not f:
+                sys.exit(f'ERROR: Cannot find {label} in {wip_dir}')
+        print(f'  polsat_master : {polsat_master.name}')
+        print(f'  web_master    : {web_master.name}')
+        print(f'  tnt_mka       : {tnt_mka.name}')
+        print(f'  dazn_mka      : {dazn_mka.name}')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        combined = out_dir / 'combined_master.mkv'
+        mux_combined(polsat_master, web_master, tnt_mka, dazn_mka, combined)
+        print(f'\nDone -> {combined}')
+        return
+
+    round_num = args.round
+    session   = args.session
+    if not round_num or not session:
+        sys.exit('ERROR: --round and --session are required unless --mux-only is set')
+    calendar  = CALENDARS.get(args.year)
+    if calendar is None:
+        sys.exit(f'ERROR: No calendar for year {args.year} (supported: {sorted(CALENDARS)})')
+    country   = calendar.get(round_num)
+    if not country:
+        sys.exit(f'ERROR: Round {round_num} not in {args.year} calendar (valid: 1-22)')
+    round_str = f'{round_num:02d}'
+
+    # ── Fingerprint check ──
+    fp_sting    = FP_DIR / 'prerace_sting.wav'
+    fp_sting_gp = FP_DIR / 'prerace_sting_motogp.wav'
+    for fp in (fp_sting, fp_sting_gp):
+        if not fp.exists():
+            sys.exit(f'ERROR: Missing fingerprint: {fp}')
 
     skip_mux = args.combined_master is not None
     for label, f in (('polsat_master', polsat_master), ('web_master', web_master),
@@ -548,7 +564,7 @@ def main():
     moto2_start, motogp_start, moto2_dur, motogp_dur, moto2_frames, motogp_frames = \
         detect_split_points(str(web_master), polsat_master, moto2_webdl, motogp_webdl)
 
-    print(f'\n── Split plan ───────────────────────────────────────────────')
+    print(f'\n-- Split plan -------------------------------------------')
     print(f'  Moto3 : t=0             dur={moto3_dur:.3f}s  {moto3_frames} frames')
     print(f'  Moto2 : t={moto2_start:.3f}s  dur={moto2_dur:.3f}s  {moto2_frames} frames')
     print(f'  MotoGP: t={motogp_start:.3f}s  dur={motogp_dur:.3f}s  {motogp_frames} frames')
@@ -590,15 +606,19 @@ def main():
             f'Polsat.HDTV.{resolution}.{codec}.Multi5.mkv'
         )
 
+    exclude_audio = args.exclude_audio or []
+    if exclude_audio:
+        print(f'\nExcluding audio tracks {exclude_audio} from split output files.')
+
     for cls, t_start, dur, frames in (
         ('Moto3',  0.0,          moto3_dur,  moto3_frames),
         ('Moto2',  moto2_start,  moto2_dur,  moto2_frames),
         ('MotoGP', motogp_start, motogp_dur, motogp_frames),
     ):
         out_file = output_name(cls)
-        print(f'\n── {cls}: t={t_start:.3f}s  {frames} frames')
+        print(f'\n-- {cls}: t={t_start:.3f}s  {frames} frames')
         print(f'   -> {out_file.name}')
-        smart_cut(combined, out_file, t_start, dur, codec)
+        smart_cut(combined, out_file, t_start, dur, codec, exclude_audio)
 
     # Optionally delete combined master (never delete a user-provided file)
     if not skip_mux and not args.keep_combined and combined.exists():
