@@ -168,13 +168,14 @@ def build_and_concat(canal_file, master_file, canal_stream, ns_stream,
 
 # ── Race modes ────────────────────────────────────────────────────────────────
 
-def sprint_mode(canal_file, master_file, output_dir, dry_run):
+def sprint_mode(canal_file, master_file, output_dir, dry_run,
+                anchor_source=None, anchor_master=None):
     """
     Canal+ Sprint: opening sting (10s) + 2 ad breaks.
 
     Break 1: canal_grid_ending.wav -> canal_moto3_sting.wav + 17s
     Break 2: 2s silence (~58m40s) -> canal_opening.wav + 12s
-    Sync:    canal_sprint_podium.wav at ~1h08m55s in canal, search broadly in master
+    Sync:    canal_sprint_podium.wav (or frame-based anchor via --anchor-source/master)
     """
     CANAL_STREAM = '0:a:0'
     OPENING_DUR  = 10.0   # opening sting duration at start of Sprint file
@@ -186,19 +187,27 @@ def sprint_mode(canal_file, master_file, output_dir, dry_run):
     print(f'Canal:  {d_canal:.1f}s  ({d_canal/3600:.2f}h)')
     print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
 
-    # ── Sync anchor: podium music ──────────────────────────────────────────
-    print('\nLocating podium music (sync anchor)...')
-    fp_podium = str(FP_DIR / 'canal_sprint_podium.wav')
-    canal_podium, c_conf = find_sting(
-        canal_file, fp_podium, 4015, 240, CANAL_STREAM, 'Podium (canal)',
-        tmp_suffix='_sprint')
-    master_podium, m_conf = find_sting(
-        master_file, fp_podium, 3400, 1800, ns_stream, 'Podium (master)',
-        tmp_suffix='_sprint')
-    if c_conf < 0.05 or m_conf < 0.05:
-        print(f'  WARNING: Low podium confidence '
-              f'(canal={c_conf:.4f}, master={m_conf:.4f}) - check output')
-    offset = master_podium - canal_podium
+    # ── Sync anchor ────────────────────────────────────────────────────────
+    if anchor_source is not None and anchor_master is not None:
+        # Frame-based anchor override
+        # Canal offset convention: canal_time + offset = master_time
+        offset = anchor_master - anchor_source
+        print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
+        print(f'  Offset: {offset:.3f}s  (master_time = canal_time + {offset:.3f})')
+    else:
+        # ── Sync anchor: podium music ──────────────────────────────────────
+        print('\nLocating podium music (sync anchor)...')
+        fp_podium = str(FP_DIR / 'canal_sprint_podium.wav')
+        canal_podium, c_conf = find_sting(
+            canal_file, fp_podium, 4015, 240, CANAL_STREAM, 'Podium (canal)',
+            tmp_suffix='_sprint')
+        master_podium, m_conf = find_sting(
+            master_file, fp_podium, 3400, 1800, ns_stream, 'Podium (master)',
+            tmp_suffix='_sprint')
+        if c_conf < 0.05 or m_conf < 0.05:
+            print(f'  WARNING: Low podium confidence '
+                  f'(canal={c_conf:.4f}, master={m_conf:.4f}) - check output')
+        offset = master_podium - canal_podium
 
     # ── Break 1 ───────────────────────────────────────────────────────────
     print('\nLocating break 1...')
@@ -456,6 +465,10 @@ def main():
                         help='Race type / break structure.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Detect and plan only; do not encode.')
+    parser.add_argument('--anchor-source', type=float, default=None,
+                        help='Frame-based anchor time in source file (seconds).')
+    parser.add_argument('--anchor-master', type=float, default=None,
+                        help='Frame-based anchor time in master file (seconds).')
     parser.add_argument('canal_file')
     parser.add_argument('master_file')
     parser.add_argument('output_dir')
@@ -481,14 +494,13 @@ def main():
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    modes = {
-        'sprint': sprint_mode,
-        'moto3':  moto3_mode,
-        'moto2':  moto2_mode,
-        'motogp': motogp_mode,
-    }
-    modes[args.race](args.canal_file, args.master_file,
-                     args.output_dir, args.dry_run)
+    if args.race == 'sprint':
+        sprint_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                    anchor_source=args.anchor_source, anchor_master=args.anchor_master)
+    else:
+        modes = {'moto3': moto3_mode, 'moto2': moto2_mode, 'motogp': motogp_mode}
+        modes[args.race](args.canal_file, args.master_file,
+                         args.output_dir, args.dry_run)
 
 
 if __name__ == '__main__':

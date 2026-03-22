@@ -269,6 +269,10 @@ def build_and_concat(sporttv, web_master, breaks, show_start_sporttv,
     sporttv_cur = show_start_sporttv
 
     for brk_s, brk_e in inner:
+        if brk_s < sporttv_cur:
+            print(f'  [STV] Skipping overlapping break at {brk_s:.1f}s '
+                  f'(already past {sporttv_cur:.1f}s)')
+            continue
         sporttv_dur = brk_s - sporttv_cur
         master_end  = mtime(brk_s)
         if master_end > d_web:

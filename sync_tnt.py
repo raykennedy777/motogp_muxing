@@ -22,7 +22,7 @@ Usage:
 import sys
 from pathlib import Path
 
-from audio_utils import get_duration, extract_seg, concat_segments_to_mka
+from audio_utils import fmt, get_duration, extract_seg, concat_segments_to_mka
 from sting_detection import find_sting, find_all_transitions
 
 # Search window for Moto3 sting in web master (absolute)
@@ -157,8 +157,29 @@ def main():
         sys.argv.remove('--dry-run')
         print('[DRY RUN] Detection and segment planning only — no audio will be encoded.')
 
+    sprint_mode   = '--sprint' in sys.argv
+    anchor_source = None
+    anchor_master = None
+    manual_breaks = []
+    if sprint_mode:
+        sys.argv.remove('--sprint')
+    for arg in list(sys.argv[1:]):
+        if arg.startswith('--anchor-source='):
+            anchor_source = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--anchor-master='):
+            anchor_master = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--break='):
+            s, e = arg.split('=', 1)[1].split(':')
+            manual_breaks.append((float(s), float(e)))
+            sys.argv.remove(arg)
+    if sprint_mode and (anchor_source is None or anchor_master is None):
+        sys.exit('ERROR: --sprint requires --anchor-source=S and --anchor-master=S')
+
     if len(sys.argv) != 4:
-        sys.exit('Usage: sync_tnt.py [--dry-run] <tnt_file> <web_master.mkv> <output_dir>')
+        sys.exit('Usage: sync_tnt.py [--dry-run] [--sprint --anchor-source=S --anchor-master=S] '
+                 '[--break=S:E] <tnt_file> <web_master.mkv> <output_dir>')
 
     tnt_file, web_master, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
     output_mka = Path(out_dir) / (Path(tnt_file).stem + '_synced.mka')
@@ -188,95 +209,124 @@ def main():
     print(f'TNT: {d_tnt:.1f}s ({d_tnt/3600:.2f}h)  |  '
           f'Web master: {d_web:.1f}s ({d_web/3600:.2f}h)')
 
-    # ── Find pre-race sting positions in web master (Natural Sounds track) ──
-    print('\nLocating pre-race stings in web master...')
-    m3_master, _ = find_sting(web_master, fp_sting,
-                               *MOTO3_STING_SEARCH, stream_spec='0:a:1',
-                               label='  Moto3 sting (master)')
-    m2_master, _ = find_sting(web_master, fp_sting,
-                               m3_master + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN,
-                               STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
-                               label='  Moto2 sting (master)')
-    mgp_master, _= find_sting(web_master, fp_sting_gp,
-                               m2_master + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN,
-                               STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
-                               label='  MotoGP sting (master)')
+    if sprint_mode:
+        # ── Sprint mode: use frame-based anchor directly ──
+        offset = anchor_source - anchor_master   # tnt_time - offset = master_time
+        print(f'\nSprint mode — anchor: TNT {fmt(anchor_source)} = master {fmt(anchor_master)}')
+        print(f'  Offset: {offset:.3f}s  (master_time = tnt_time - {offset:.3f})')
 
-    # ── Find Moto3 sting in TNT ──
-    print('\nSearching for Moto3 pre-race sting in TNT...')
-    # TNT has ~59 min of studio before Moto3; search 20-110 min window
-    m3_tnt, m3_conf = find_sting(tnt_file, fp_sting,
-                                  1200, 5400, label='  Moto3 sting (TNT)')
-    if m3_conf < 0.1:
-        sys.exit('ERROR: Could not find Moto3 pre-race sting in TNT. '
-                 'Check fingerprint or search window.')
+    else:
+        # ── Sunday mode: find Moto3 sting in web master and TNT ──
+        print('\nLocating pre-race stings in web master...')
+        m3_master, _ = find_sting(web_master, fp_sting,
+                                   *MOTO3_STING_SEARCH, stream_spec='0:a:1',
+                                   label='  Moto3 sting (master)')
+        m2_master, _ = find_sting(web_master, fp_sting,
+                                   m3_master + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN,
+                                   STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
+                                   label='  Moto2 sting (master)')
+        mgp_master, _= find_sting(web_master, fp_sting_gp,
+                                   m2_master + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN,
+                                   STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
+                                   label='  MotoGP sting (master)')
 
-    offset = m3_tnt - m3_master  # tnt_time - offset = master_time
-    print(f'  TNT offset: {offset:.3f}s  '
-          f'(master_time = tnt_time - {offset:.3f})')
+        print('\nSearching for Moto3 pre-race sting in TNT...')
+        m3_tnt, m3_conf = find_sting(tnt_file, fp_sting,
+                                      1200, 5400, label='  Moto3 sting (TNT)')
+        if m3_conf < 0.1:
+            sys.exit('ERROR: Could not find Moto3 pre-race sting in TNT. '
+                     'Check fingerprint or search window.')
 
-    # ── Find Moto2 and MotoGP stings in TNT (informational) ──
-    print('\nSearching for Moto2/MotoGP stings in TNT (informational)...')
-    m2_tnt,  m2_conf  = find_sting(tnt_file, fp_sting,
-                                    max(0, m3_tnt + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN),
-                                    STING_SEARCH_MARGIN * 2,
-                                    label='  Moto2 sting (TNT)')
-    mgp_tnt, mgp_conf = find_sting(tnt_file, fp_sting_gp,
-                                    max(0, m2_tnt + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN),
-                                    STING_SEARCH_MARGIN * 2,
-                                    label='  MotoGP sting (TNT)')
-    print(f'  Moto2 drift:  {m2_tnt - (m3_tnt + MOTO3_TO_MOTO2_SECS):+.1f}s')
-    print(f'  MotoGP drift: {mgp_tnt - (m2_tnt + MOTO2_TO_MOTOGP_SECS):+.1f}s')
+        offset = m3_tnt - m3_master
+        print(f'  TNT offset: {offset:.3f}s  (master_time = tnt_time - {offset:.3f})')
+
+        print('\nSearching for Moto2/MotoGP stings in TNT (informational)...')
+        m2_tnt,  m2_conf  = find_sting(tnt_file, fp_sting,
+                                        max(0, m3_tnt + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN),
+                                        STING_SEARCH_MARGIN * 2,
+                                        label='  Moto2 sting (TNT)')
+        mgp_tnt, mgp_conf = find_sting(tnt_file, fp_sting_gp,
+                                        max(0, m2_tnt + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN),
+                                        STING_SEARCH_MARGIN * 2,
+                                        label='  MotoGP sting (TNT)')
+        print(f'  Moto2 drift:  {m2_tnt - (m3_tnt + MOTO3_TO_MOTO2_SECS):+.1f}s')
+        print(f'  MotoGP drift: {mgp_tnt - (m2_tnt + MOTO2_TO_MOTOGP_SECS):+.1f}s')
 
     # ── Find all break transitions ──
     print('\nScanning TNT for ad break transitions...')
     events = find_all_transitions(tnt_file, fp_list)
 
     if len(events) < 2:
-        sys.exit('ERROR: Fewer than 2 transition events found. '
-                 'Check fingerprints or CONF_THRESH.')
+        if sprint_mode:
+            print('  WARNING: Fewer than 2 transition events found.')
+            breaks = []
+        else:
+            sys.exit('ERROR: Fewer than 2 transition events found. '
+                     'Check fingerprints or CONF_THRESH.')
+    else:
+        breaks = []
 
-    print(f'  {len(events)} transition events:')
-    for t, c, d in events:
-        print(f'    {t:.1f}s ({t/60:.1f} min)  conf={c:.4f}  clip={d:.1f}s')
+    if events:
+        print(f'  {len(events)} transition events:')
+        for t, c, d in events:
+            print(f'    {fmt(t)}  conf={c:.4f}  clip={d:.1f}s')
 
-    breaks = pair_breaks(events)
+    if len(events) >= 2:
+        breaks = pair_breaks(events)
     print(f'\n  {len(breaks)} ad breaks:')
     for i, (s, e) in enumerate(breaks):
         ms, me = s - offset, e - offset
-        print(f'    Break {i+1}: TNT {s:.1f}s-{e:.1f}s  '
-              f'dur={e-s:.1f}s  master {ms:.1f}s-{me:.1f}s')
+        print(f'    Break {i+1}: TNT {fmt(s)}-{fmt(e)}  '
+              f'dur={e-s:.1f}s  master {fmt(ms)}-{fmt(me)}')
 
-    # ── Identify pre-Moto3 break ──
-    pre_breaks = [(s, e) for s, e in breaks if s < m3_tnt]
-    if not pre_breaks:
-        sys.exit('ERROR: No break found before Moto3 sting in TNT.')
-    pre_break = pre_breaks[-1]
-    pre_break_end_tnt = pre_break[1]
-    print(f'\nPre-Moto3 break : TNT {pre_break[0]:.1f}s - {pre_break_end_tnt:.1f}s')
-    print(f'  TNT commentary starts at TNT {pre_break_end_tnt:.1f}s '
-          f'= master {pre_break_end_tnt - offset:.1f}s')
+    if manual_breaks:
+        breaks = sorted(breaks + manual_breaks, key=lambda x: x[0])
+        print(f'  {len(manual_breaks)} manual break(s) added; total {len(breaks)} break(s).')
 
-    # ── Identify post-MotoGP podium break ──
-    # First break starting at least 1 hour after MotoGP sting in TNT,
-    # but still within the master duration. If none found, end TNT at master end.
-    if mgp_conf >= 0.1:
-        pgp_threshold = mgp_tnt + 3600
+    if sprint_mode:
+        # Show start: last break ending before anchor (= last pre-race break end)
+        pre_breaks = [(s, e) for s, e in breaks if e < anchor_source]
+        if pre_breaks:
+            pre_break_end_tnt = pre_breaks[-1][1]
+            print(f'\nSprint show start (last pre-anchor break end): '
+                  f'TNT {fmt(pre_break_end_tnt)} = master {fmt(pre_break_end_tnt - offset)}')
+        else:
+            pre_break_end_tnt = 0.0
+            print(f'\nNo pre-anchor break found; TNT commentary starts at t=0 '
+                  f'= master {fmt(-offset)}')
+        # Show end: full overlap with master (no post-race boundary)
+        post_gp_break_start_tnt = offset + d_web
+        print(f'Sprint show end: TNT section runs to master end (no NS tail).')
+
     else:
-        pgp_threshold = m3_tnt + (mgp_master - m3_master) + 3600
-    master_end_tnt = offset + d_web
-    post_breaks = [(s, e) for s, e in breaks
-                   if s > pgp_threshold and s < master_end_tnt]
-    if not post_breaks:
-        post_gp_break_start_tnt = master_end_tnt
-        print('  No post-MotoGP break within master duration; '
-              'TNT section runs to master end, no NS tail.')
-    else:
-        post_break = post_breaks[0]
-        post_gp_break_start_tnt = post_break[0]
-        pgp_master = post_gp_break_start_tnt - offset
-        print(f'Post-MotoGP break: TNT {post_break[0]:.1f}s - {post_break[1]:.1f}s  '
-              f'= master {pgp_master:.1f}s')
+        # ── Identify pre-Moto3 break ──
+        pre_breaks = [(s, e) for s, e in breaks if s < m3_tnt]
+        if not pre_breaks:
+            sys.exit('ERROR: No break found before Moto3 sting in TNT.')
+        pre_break = pre_breaks[-1]
+        pre_break_end_tnt = pre_break[1]
+        print(f'\nPre-Moto3 break : TNT {pre_break[0]:.1f}s - {pre_break_end_tnt:.1f}s')
+        print(f'  TNT commentary starts at TNT {pre_break_end_tnt:.1f}s '
+              f'= master {pre_break_end_tnt - offset:.1f}s')
+
+        # ── Identify post-MotoGP podium break ──
+        if mgp_conf >= 0.1:
+            pgp_threshold = mgp_tnt + 3600
+        else:
+            pgp_threshold = m3_tnt + (mgp_master - m3_master) + 3600
+        master_end_tnt = offset + d_web
+        post_breaks = [(s, e) for s, e in breaks
+                       if s > pgp_threshold and s < master_end_tnt]
+        if not post_breaks:
+            post_gp_break_start_tnt = master_end_tnt
+            print('  No post-MotoGP break within master duration; '
+                  'TNT section runs to master end, no NS tail.')
+        else:
+            post_break = post_breaks[0]
+            post_gp_break_start_tnt = post_break[0]
+            pgp_master = post_gp_break_start_tnt - offset
+            print(f'Post-MotoGP break: TNT {post_break[0]:.1f}s - {post_break[1]:.1f}s  '
+                  f'= master {pgp_master:.1f}s')
 
     # ── Build output ──
     print('\nBuilding output segments...')

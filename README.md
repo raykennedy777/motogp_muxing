@@ -50,7 +50,7 @@ ServusTV / Sport TV /     --+
 Same as Sunday except web masters don't need combining (single race) and no splitting at the end — just the final mux.
 
 ### Audio track order (per CLAUDE.md)
-World Feed · TNT Sports · DAZN · ESPN · Sky Sport MotoGP · RSI · Canal+ · RTBF · RTS · Sky Sport (DE) · ServusTV · Sport TV · ESPN4 · Ziggo · Polsat Sport · Natural Sounds
+World Feed · TNT Sports · DAZN · ESPN · Sky Sport MotoGP · RSI · Canal+ · RTBF · RTS · Sky Sport (DE) · ServusTV · SRF · Sport TV · ESPN4 · Ziggo · Polsat Sport · Natural Sounds
 
 ---
 

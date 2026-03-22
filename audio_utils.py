@@ -76,6 +76,16 @@ def _peak(haystack, needle):
     return idx, conf
 
 
+def fmt(secs):
+    """Format seconds as hh:mm:ss.hh (hundredths of a second)."""
+    neg = secs < 0
+    s   = abs(secs)
+    h   = int(s // 3600)
+    m   = int((s % 3600) // 60)
+    sec = s % 60
+    return f'{"-" if neg else ""}{h:02d}:{m:02d}:{sec:05.2f}'
+
+
 def concat_segments_to_mka(seg_paths, output_mka, list_path_prefix='_tmp'):
     """Write a concat list, run ffmpeg AAC encode, then remove the list file."""
     list_path = f'{list_path_prefix}_concat.txt'

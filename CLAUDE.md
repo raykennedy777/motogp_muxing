@@ -14,11 +14,12 @@ When muxing final files, include tracks in this order (skip any that don't exist
 9. RTS (French)
 10. Sky Sport (German)
 11. ServusTV (German)
-12. Sport TV (Portuguese)
-13. ESPN4 (Portuguese)
-14. Ziggo (Dutch)
-15. Polsat Sport (Polish)
-16. Natural Sounds (undetermined)
+12. SRF (German)
+13. Sport TV (Portuguese)
+14. ESPN4 (Portuguese)
+15. Ziggo (Dutch)
+16. Polsat Sport (Polish)
+17. Natural Sounds (undetermined)
 
 ---
 
