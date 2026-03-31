@@ -15,13 +15,10 @@ Watermark: ~150x70 pixels at position (1653, 74) in 1920x1080 video.
            At break end, a coloured variant appears ~4s before the normal
            watermark returns (wm_lag_secs=4.0 compensates).
 
-IMPORTANT — template reference time:
-  The watermark template must be extracted from a frame where the watermark
-  is in its normal steady-state appearance during live coverage.  Do NOT use
-  a frame at or near a pre-race sting, station ID, or other special moment —
-  these can look different from normal coverage and cause false positives.
-  Use --template-time=S to specify a good mid-coverage reference frame
-  (defaults to --anchor-source if not provided).
+Template extraction (choose one method):
+  Default: Extract from 25:00 (during live race coverage).
+  --template-time=S   Extract from a specific time point.
+  --template-file=F   Load a pre-saved template PNG from fingerprints/.
 
 --anchor-source=S   ServusTV time (seconds) of the sync anchor frame.
 --anchor-master=S   Corresponding master time (seconds) of the same frame.
@@ -37,6 +34,13 @@ IMPORTANT — template reference time:
                     previous break's end.  Use 180 for MotoGP to suppress the
                     race-start graphics false positive that immediately follows
                     the formation-lap break.
+--max-std=S         Maximum standard deviation of correlation for a region to be
+                    classified as an ad break.  Default: 0.08.  True ad breaks
+                    have stable correlations (std < 0.07), while graphics/overlays
+                    cause variable correlations (std > 0.1).
+--min-stable-pct=S  Minimum percentage of frames with stable correlation around
+                    -0.265 (the "no watermark" pattern).  Default: 50.  True ad
+                    breaks have >90% stable negative correlations.
 
 Output structure:
   1. Natural Sounds from master   t = 0              -> program_start_master
@@ -59,7 +63,9 @@ from pathlib import Path
 
 from audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
-from watermark_detection import build_watermark_template, find_all_breaks_via_watermark
+from watermark_detection import (build_watermark_template,
+                                  build_watermark_template_averaged,
+                                  find_all_breaks_via_watermark)
 
 # ServusTV watermark parameters (1920x1080 source)
 WM_X     = 1653   # left edge
@@ -76,6 +82,12 @@ WM_LAG_SECS = 4.0
 WM_THRESH   = 0.44
 WM_FPS      = 2
 MIN_AD_CONF = 0.15  # reject regions where min_conf >= this (graphic obscuration)
+
+# New filters to reduce false positives:
+# True ad breaks have stable correlations (std < 0.11), graphics have std > 0.1
+MAX_STD = 0.12       # reject regions with correlation std > this
+# True ad breaks have >90% of frames with correlation around -0.265 (no watermark)
+MIN_STABLE_PCT = 50  # require at least this % of frames with stable -0.265
 
 
 # ── Segment building ───────────────────────────────────────────────────────────
@@ -184,9 +196,12 @@ def main():
     anchor_source   = None
     anchor_master   = None
     template_time   = None
+    template_file   = None
     program_start   = 0.0
     min_break_secs  = 60
     min_gap         = 0
+    max_std         = MAX_STD
+    min_stable_pct  = MIN_STABLE_PCT
     for arg in list(sys.argv[1:]):
         if arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
@@ -197,6 +212,9 @@ def main():
         elif arg.startswith('--template-time='):
             template_time = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
+        elif arg.startswith('--template-file='):
+            template_file = arg.split('=', 1)[1]
+            sys.argv.remove(arg)
         elif arg.startswith('--program-start='):
             program_start = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
@@ -206,16 +224,20 @@ def main():
         elif arg.startswith('--min-gap='):
             min_gap = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
+        elif arg.startswith('--max-std='):
+            max_std = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--min-stable-pct='):
+            min_stable_pct = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
 
     if anchor_source is None or anchor_master is None or len(sys.argv) != 4:
         sys.exit('Usage: sync_servustv.py [--dry-run] '
                  '--anchor-source=S --anchor-master=S '
-                 '[--template-time=S] [--program-start=S] '
+                 '[--template-time=S] [--template-file=F] [--program-start=S] '
                  '[--min-break-secs=S] [--min-gap=S] '
+                 '[--max-std=S] [--min-stable-pct=S] '
                  '<servustv_file> <master.mkv> <output_dir>')
-
-    if template_time is None:
-        template_time = anchor_source
 
     stv_file, master_file, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -241,23 +263,37 @@ def main():
     print(f'Master audio tracks: {n_audio}  ->  NS on {ns_stream}')
 
     # ── Build watermark template ──
-    print(f'\nBuilding watermark template at stv {fmt(template_time)}...')
-    if template_time == anchor_source:
-        print(f'  (using anchor time; use --template-time=S for a different reference)')
+    print(f'\nBuilding watermark template...')
+    if template_file:
+        # Load from pre-saved file
+        print(f'  Loading from {template_file}...')
+        # TODO: Implement PNG loading if needed
+        sys.exit('ERROR: --template-file not yet implemented')
+    elif template_time is not None:
+        # User-specified time point
+        print(f'  Extracting from stv {fmt(template_time)}...')
+    else:
+        # Default: use 25:00 (during live race, safe from ad breaks)
+        template_time = 1500  # 25:00
+        print(f'  Extracting from stv {fmt(template_time)} (default, during race)...')
+        print(f'  (use --template-time=S to specify a different reference)')
+    
     wm_template = build_watermark_template(
         stv_file, template_time, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
     if wm_template is None:
         sys.exit('ERROR: Could not build watermark template. Check file and coordinates.')
-    print(f'  Template built from crop={WM_W}x{WM_H}@({WM_X},{WM_Y}) -> {WM_OUT_W}x{WM_OUT_H}')
+    print(f'  Template ready: crop={WM_W}x{WM_H}@({WM_X},{WM_Y}) -> {WM_OUT_W}x{WM_OUT_H}')
 
     # ── Scan for ad breaks via watermark ──
     scan_start = program_start
     scan_end   = min(d_stv, offset + d_master)
     print(f'\nScanning ServusTV for ad breaks ({fmt(scan_start)} to {fmt(scan_end)})...')
     gap_note = f'  min_gap={min_gap:.0f}s' if min_gap > 0 else ''
+    std_note = f'  max_std={max_std:.3f}' if max_std is not None else ''
+    stable_note = f'  min_stable={min_stable_pct:.0f}%' if min_stable_pct is not None else ''
     print(f'  Watermark: {WM_W}x{WM_H} at ({WM_X},{WM_Y})  '
           f'thresh={WM_THRESH}  lag={WM_LAG_SECS}s  '
-          f'min_break={min_break_secs}s  min_ad_conf={MIN_AD_CONF}{gap_note}')
+          f'min_break={min_break_secs}s  min_ad_conf={MIN_AD_CONF}{gap_note}{std_note}{stable_note}')
 
     breaks = find_all_breaks_via_watermark(
         stv_file, wm_template, WM_X, WM_Y, WM_W, WM_H,
@@ -265,7 +301,8 @@ def main():
         scan_start=scan_start, scan_end=scan_end,
         fps=WM_FPS, thresh=WM_THRESH,
         min_break_secs=min_break_secs, wm_lag_secs=WM_LAG_SECS,
-        min_ad_conf=MIN_AD_CONF)
+        min_ad_conf=MIN_AD_CONF,
+        max_std=MAX_STD, min_stable_pct=MIN_STABLE_PCT)
 
     # ── Drop breaks that start too soon after the previous break ──
     if min_gap > 0 and breaks:

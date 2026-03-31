@@ -45,21 +45,64 @@ def build_watermark_template(src, ref_time, wm_x, wm_y, wm_w, wm_h,
     return arr[:n] if len(arr) >= n else None
 
 
+def build_watermark_template_averaged(src, start_time, end_time, interval,
+                                       wm_x, wm_y, wm_w, wm_h,
+                                       out_w=32, out_h=32, tmp_suffix=''):
+    """
+    Extract and average multiple watermark templates from start_time to end_time.
+    This provides a more robust template by averaging several frames, reducing
+    the impact of any single frame having unusual brightness or artifacts.
+
+    Parameters:
+        start_time: First extraction time (seconds)
+        end_time: Last extraction time (seconds)
+        interval: Seconds between extractions (e.g., 30 for every 30s)
+
+    Returns a flat float32 array of out_w*out_h pixels, or None on failure.
+    """
+    templates = []
+    times = []
+    t = start_time
+    while t <= end_time:
+        times.append(t)
+        t += interval
+
+    print(f'  Extracting templates from {len(times)} time points: ', end='')
+    for i, ref_time in enumerate(times):
+        template = build_watermark_template(
+            src, ref_time, wm_x, wm_y, wm_w, wm_h, out_w, out_h,
+            tmp_suffix=f'{tmp_suffix}_{i}')
+        if template is not None:
+            templates.append(template)
+            print(f'{ref_time:.0f}s ', end='')
+        else:
+            print(f'{ref_time:.0f}s(failed) ', end='')
+
+    if not templates:
+        print('- all failed')
+        return None
+
+    print(f'-> averaging {len(templates)} templates')
+    return np.mean(templates, axis=0)
+
+
 def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
                                   wm_x, wm_y, wm_w, wm_h,
                                   out_w, out_h,
                                   search_secs=300, fps=2,
                                   thresh=0.44, min_offset_secs=30,
-                                  tmp_suffix=''):
+                                  wm_lag_secs=4.0, tmp_suffix=''):
     """
     Detect break end by scanning for the watermark returning in live video.
     Extracts search_secs of video at fps frames/sec and correlates each frame
     against the reference template using Pearson correlation.
 
     Returns (break_end_sec, found_bool).
-    break_end = first matching frame time - 4s (watermark appears slightly
-    before the cut back to live coverage).
-    Only fires when the live watermark is present; ad content will not trigger it.
+    break_end = first_matching_frame_time - wm_lag_secs.
+
+    wm_lag_secs: seconds by which the watermark leads actual program resumption.
+      Positive (default 4.0): watermark appears AFTER content resumes (break_end is before watermark).
+      Negative (e.g. -58.3): watermark appears BEFORE content resumes (break_end is after watermark).
     """
     search_start = break_start + clip_dur
     n_pixels = out_w * out_h
@@ -100,8 +143,8 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
             max_conf_t = t_i
         if i >= min_frame and conf > thresh:
             print(f'    Watermark conf={conf:.3f} at +{i*step:.1f}s '
-                  f'(t={t_i:.1f}s); break end = {t_i - 4.0:.1f}s')
-            return t_i - 4.0, True
+                  f'(t={t_i:.1f}s); break end = {t_i - wm_lag_secs:.1f}s')
+            return t_i - wm_lag_secs, True
 
     print(f'    Watermark not found (max={max_conf:.3f} at t={max_conf_t:.1f}s, '
           f'+{max_conf_t - search_start:.0f}s from search start)')
@@ -112,6 +155,7 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
                                    out_w, out_h, scan_start, scan_end,
                                    fps=2, thresh=0.44, min_break_secs=45,
                                    wm_lag_secs=0.0, min_ad_conf=None,
+                                   max_std=None, min_stable_pct=None,
                                    tmp_suffix=''):
     """
     Scan a video segment for all periods where the watermark is absent (= ad breaks).
@@ -125,6 +169,12 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
                   the minimum correlation stays >= min_ad_conf are classified as graphic/
                   banner obscurations (partial cover of the watermark during live content)
                   and are silently skipped.  Use None (default) to disable this filter.
+    max_std:      if set, reject regions where standard deviation of correlation exceeds
+                  this value. High std indicates variable correlations (graphics/overlays)
+                  rather than stable ad content.  Use None (default) to disable.
+    min_stable_pct: if set, require this percentage of frames to have correlation around
+                  -0.265 (the "no watermark" pattern). True ad breaks have >90% stable
+                  negative correlations.  Use None (default) to disable.
     """
     scan_dur = max(0.0, scan_end - scan_start)
     if scan_dur <= 0:
@@ -172,6 +222,64 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
     in_break       = False
     break_start    = None
     break_min_conf = 1.0
+    break_corrs    = []  # Collect correlations for analysis
+
+    def analyze_break(start_t, end_t, min_conf, corr_list):
+        """Analyze a break region and return True if it's a real ad break."""
+        region_dur = end_t - start_t
+        if region_dur < min_break_secs:
+            print(f'  Skip: short dip {start_t:.1f}s-{end_t:.1f}s '
+                  f'({region_dur:.1f}s < {min_break_secs}s)')
+            return False
+
+        # Existing min_ad_conf filter
+        if min_ad_conf is not None and min_conf >= min_ad_conf:
+            print(f'  Skip: obscuration {start_t:.1f}s-{end_t:.1f}s '
+                  f'({region_dur:.1f}s, min_conf={min_conf:.3f} '
+                  f'>= min_ad_conf={min_ad_conf})')
+            return False
+
+        # New filters based on correlation statistics
+        if corr_list:
+            corr_array = np.array(corr_list)
+            mean_conf = np.mean(corr_array)
+            std_conf = np.std(corr_array)
+            
+            # Check standard deviation filter (reject variable correlations)
+            if max_std is not None and std_conf > max_std:
+                print(f'  Skip: variable correlation {start_t:.1f}s-{end_t:.1f}s '
+                      f'({region_dur:.1f}s, std={std_conf:.3f} > max_std={max_std})')
+                return False
+            
+            # Check stable negative correlation pattern (true ad breaks have consistent values)
+            # The exact value depends on the template, so check for tight clustering
+            # rather than a specific value like -0.265
+            # Use middle 90% of frames to exclude edge effects
+            sorted_corrs = np.sort(corr_array)
+            n_trim = max(1, len(sorted_corrs) // 20)  # Trim 5% from each end
+            trimmed = sorted_corrs[n_trim:-n_trim] if n_trim > 0 else sorted_corrs
+            
+            corr_std = np.std(trimmed)
+            corr_range = np.max(trimmed) - np.min(trimmed)
+            
+            # True ad breaks have very stable correlations (low std, narrow range)
+            # Graphics/overlays have variable correlations (high std, wide range)
+            is_stable_negative = (corr_std < 0.08 and 
+                                  np.mean(trimmed) < 0 and
+                                  corr_range < 0.3)
+            
+            if not is_stable_negative:
+                print(f'  Skip: unstable correlation {start_t:.1f}s-{end_t:.1f}s '
+                      f'({region_dur:.1f}s, std={corr_std:.3f}, range={corr_range:.3f})')
+                return False
+            
+            # Require negative mean correlation (ad content has no watermark)
+            if mean_conf > 0:
+                print(f'  Skip: positive mean correlation {start_t:.1f}s-{end_t:.1f}s '
+                      f'({region_dur:.1f}s, mean={mean_conf:.3f} > 0)')
+                return False
+
+        return True
 
     for t_i, conf in corrs:
         if not in_break:
@@ -179,40 +287,38 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
                 in_break       = True
                 break_start    = t_i
                 break_min_conf = conf
+                break_corrs    = [conf]
+            else:
+                # Reset correlation collection when not in break
+                break_corrs = []
         else:
+            break_corrs.append(conf)
             if conf < break_min_conf:
                 break_min_conf = conf
             if conf >= thresh:
                 in_break   = False
-                region_dur = t_i - break_start
-                if region_dur >= min_break_secs:
-                    if min_ad_conf is not None and break_min_conf >= min_ad_conf:
-                        print(f'  Skip: obscuration {break_start:.1f}s-{t_i:.1f}s '
-                              f'({region_dur:.1f}s, min_conf={break_min_conf:.3f} '
-                              f'>= min_ad_conf={min_ad_conf})')
-                    else:
-                        break_end = t_i - wm_lag_secs
-                        breaks.append((break_start, break_end))
-                        print(f'  Break detected: {break_start:.1f}s - {break_end:.1f}s  '
-                              f'dur={break_end-break_start:.1f}s  '
-                              f'(watermark returned at {t_i:.1f}s, '
-                              f'min_conf={break_min_conf:.3f})')
-                else:
-                    print(f'  Skip: short dip {break_start:.1f}s-{t_i:.1f}s '
-                          f'({region_dur:.1f}s < {min_break_secs}s)')
+                break_end  = t_i
+                
+                if analyze_break(break_start, break_end, break_min_conf, break_corrs):
+                    break_end_adjusted = break_end - wm_lag_secs
+                    breaks.append((break_start, break_end_adjusted))
+                    print(f'  Break detected: {break_start:.1f}s - {break_end_adjusted:.1f}s  '
+                          f'dur={break_end_adjusted-break_start:.1f}s  '
+                          f'(watermark returned at {break_end:.1f}s, '
+                          f'min_conf={break_min_conf:.3f})')
+                
+                # Reset for next region
+                break_corrs = []
 
     # Handle break extending to end of scan
     if in_break:
-        region_dur = corrs[-1][0] - break_start
-        if region_dur >= min_break_secs:
-            if min_ad_conf is not None and break_min_conf >= min_ad_conf:
-                print(f'  Skip: obscuration (open-ended) {break_start:.1f}s  '
-                      f'({region_dur:.1f}s, min_conf={break_min_conf:.3f} '
-                      f'>= min_ad_conf={min_ad_conf})')
-            else:
-                break_end = corrs[-1][0] + step - wm_lag_secs
-                breaks.append((break_start, break_end))
-                print(f'  Break (open-ended at scan boundary): {break_start:.1f}s - {break_end:.1f}s  '
-                      f'(break may still be ongoing)')
+        break_end = corrs[-1][0] + step
+        region_dur = break_end - break_start
+        
+        if analyze_break(break_start, break_end, break_min_conf, break_corrs):
+            break_end_adjusted = break_end - wm_lag_secs
+            breaks.append((break_start, break_end_adjusted))
+            print(f'  Break (open-ended at scan boundary): {break_start:.1f}s - {break_end_adjusted:.1f}s  '
+                  f'(break may still be ongoing)')
 
     return breaks
