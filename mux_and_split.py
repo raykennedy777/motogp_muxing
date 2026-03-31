@@ -543,8 +543,8 @@ def main():
     print(f'Round {round_str} {country} — {session}')
     print(f'  polsat_master : {polsat_master.name}')
     print(f'  web_master    : {web_master.name}')
-    print(f'  tnt_mka       : {tnt_mka.name}')
-    print(f'  dazn_mka      : {dazn_mka.name}')
+    print(f'  tnt_mka       : {tnt_mka.name if tnt_mka else "N/A (--combined-master mode)"}')
+    print(f'  dazn_mka      : {dazn_mka.name if dazn_mka else "N/A (--combined-master mode)"}')
 
     # ── Auto-detect WEB-DL files ──
     moto3_webdl = moto2_webdl = motogp_webdl = None

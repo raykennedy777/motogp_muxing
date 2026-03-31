@@ -4,8 +4,25 @@ sync_sky_it.py
 Add Sky Sport MotoGP Italian audio to a MotoGP master file.
 
 Uses a frame-based sync anchor (first camera change after race start)
-and sting-pair break detection: the same fingerprint marks both the
-lead-in (ads start) and lead-out (program resumes) of each ad break.
+and a three-tier break detection strategy:
+
+  1. Sting-pair detection (primary)
+     The same fingerprint (sky_it_leadin.wav) marks both the lead-in
+     (ads start) and lead-out (program resumes) of each ad break.
+     Consecutive events are paired; pairs > MAX_BREAK_SECS discarded.
+     If the broadcast starts mid-break (first sting is a lead-out), the
+     pairing tries both offset-0 and offset-1 and uses whichever yields
+     more valid pairs.
+
+  2. PUBBLICITÀ text detection (secondary — break START fallback)
+     A white "PUBBLICITÀ" overlay appears in the bottom-right at the
+     start of the bumper clip that precedes each ad block. Template-matched
+     against a reference frame. Used to detect starts not caught by stings.
+
+  3. MGP logo watermark reappearance (secondary — break END fallback)
+     The MGP logo (bottom-right) disappears during ads and reappears when
+     program resumes. Used only to find the END of a break whose start was
+     found via PUBBLICITÀ. Stings are used for break ends when available.
 
 Output structure:
   1. Natural Sounds from master   t = 0             → sky_start_master
@@ -14,7 +31,7 @@ Output structure:
   3. Natural Sounds from master   sky_end_master     → master end
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
-    (via audio_utils / sting_detection modules)
+    (via audio_utils / sting_detection / watermark_detection modules)
 
 Usage:
     python sync_sky_it.py [--dry-run]
@@ -22,37 +39,121 @@ Usage:
         <sky_it_file> <master.mkv> <output_dir>
 """
 
-import sys
+import subprocess, os, sys
+import numpy as np
 from pathlib import Path
 
 from audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
-from sting_detection import find_all_transitions
+from sting_detection import find_all_transitions, find_sting
+from watermark_detection import build_watermark_template, find_break_end_via_watermark
 
-FP_DIR       = Path(__file__).parent / 'fingerprints'
-MAX_BREAK_SECS = 420   # 7 min — discard pairings longer than this
+FP_DIR         = Path(__file__).parent / 'fingerprints'
+MAX_BREAK_SECS = 420    # 7 min — discard sting pairings longer than this
+WM_FALLBACK_SECS = 60.0 # break-end fallback when watermark search fails
+
+# ── PUBBLICITÀ text region (bottom-right, 1280×720) — break START indicator ──
+SKY_PUBB_X,     SKY_PUBB_Y     = 1040, 615
+SKY_PUBB_W,     SKY_PUBB_H     = 220,  50
+SKY_PUBB_OUT_W, SKY_PUBB_OUT_H = 48,   12
+SKY_PUBB_THRESH       = 0.70   # text is very distinctive; high threshold
+SKY_PUBB_SUPPRESS_SECS = 120   # min gap between detections (same break)
+
+# ── MGP logo watermark region (bottom-right, 1280×720) — break END indicator ──
+SKY_MGP_WM_X,     SKY_MGP_WM_Y     = 1100, 645
+SKY_MGP_WM_W,     SKY_MGP_WM_H     = 120,  50
+SKY_MGP_OUT_W,    SKY_MGP_OUT_H    = 32,   16
+SKY_MGP_WM_THRESH    = 0.55    # program 0.76–0.86; ad spikes max ~0.51
+SKY_MGP_WM_MIN_OFFSET = 20     # don't look for return within first 20s
 
 
 # ── Break pairing ─────────────────────────────────────────────────────────────
 
+def _pair_from(events, start_idx, verbose=True):
+    """Strictly pair events starting at start_idx: (start_idx, start_idx+1), ..."""
+    pairs = []
+    for i in range(start_idx, len(events) - 1, 2):
+        s   = events[i][0]
+        e   = events[i + 1][0] + events[i + 1][2]   # time + clip_dur
+        dur = e - s
+        if dur > MAX_BREAK_SECS:
+            if verbose:
+                print(f'  (offset={start_idx}) pair {fmt(s)}-{fmt(e)} '
+                      f'is {dur:.0f}s > {MAX_BREAK_SECS}s -- skipping')
+        else:
+            pairs.append((s, e))
+    return pairs
+
+
 def pair_breaks(events):
     """
-    Pair consecutive transition events as (break_start, break_end).
-    Sky IT uses the SAME fingerprint for lead-in and lead-out, so events
-    alternate: lead-in, lead-out, lead-in, lead-out, ...
-    Pairs > MAX_BREAK_SECS are discarded (likely a missed event).
+    Pair sting events as (lead-in, lead-out) breaks.
+    Tries pairing from index 0 and index 1 (skipping a possible orphaned
+    lead-out at the start of the broadcast), and uses whichever yields
+    more valid pairs. Returns (pairs, used_offset_1).
     """
-    breaks = []
-    for i in range(0, len(events) - 1, 2):
-        start = events[i][0]
-        end   = events[i + 1][0] + events[i + 1][2]   # time + clip_dur
-        dur   = end - start
-        if dur > MAX_BREAK_SECS:
-            print(f'  WARNING: pair at {fmt(start)}-{fmt(end)} is {dur:.0f}s '
-                  f'> {MAX_BREAK_SECS}s -- skipping (likely missed event)')
-        else:
-            breaks.append((start, end))
-    return breaks
+    if not events:
+        return [], False
+    p0 = _pair_from(events, 0)
+    p1 = _pair_from(events, 1, verbose=False)
+    if len(p1) > len(p0):
+        print(f'  NOTE: offset-1 pairing gives more valid pairs ({len(p1)} vs {len(p0)}); '
+              f'first sting treated as orphaned lead-out.')
+        return p1, True
+    return p0, False
+
+
+# ── PUBBLICITÀ detection ───────────────────────────────────────────────────────
+
+def find_pubblicita_starts(src, template, scan_start=0.0, scan_end=0.0,
+                            fps=1, thresh=SKY_PUBB_THRESH,
+                            suppress_secs=SKY_PUBB_SUPPRESS_SECS):
+    """
+    Scan for frames where the PUBBLICITÀ text overlay is visible.
+    Returns list of (time, conf) — one entry per distinct appearance,
+    suppressed by suppress_secs to avoid multiple hits per break.
+    """
+    scan_dur = max(0.0, scan_end - scan_start)
+    if scan_dur <= 0 or template is None:
+        return []
+
+    n_pixels = SKY_PUBB_OUT_W * SKY_PUBB_OUT_H
+    tmp = '_tmp_pubb_scan.raw'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+             '-ss', f'{scan_start:.3f}', '-t', f'{scan_dur:.0f}', '-i', str(src),
+             '-vf', (f'fps={fps},'
+                     f'crop={SKY_PUBB_W}:{SKY_PUBB_H}:{SKY_PUBB_X}:{SKY_PUBB_Y},'
+                     f'scale={SKY_PUBB_OUT_W}:{SKY_PUBB_OUT_H}'),
+             '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
+            check=True)
+        frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
+        os.remove(tmp)
+    except Exception as e:
+        print(f'  WARNING: PUBBLICITÀ scan failed: {e}')
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+
+    n_frames = len(frames) // n_pixels
+    step = 1.0 / fps
+    t0 = template - template.mean()
+    t0_norm = np.linalg.norm(t0)
+
+    detections  = []
+    last_detect = -suppress_secs
+
+    for i in range(n_frames):
+        frame = frames[i * n_pixels:(i + 1) * n_pixels]
+        f0    = frame - frame.mean()
+        conf  = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
+        t_i   = scan_start + i * step
+        if conf >= thresh and (t_i - last_detect) >= suppress_secs:
+            detections.append((t_i, conf))
+            last_detect = t_i
+
+    return detections
 
 
 # ── Segment building and concatenation ────────────────────────────────────────
@@ -102,7 +203,7 @@ def build_and_concat(sky_file, master_file, breaks, show_start,
               f'trimming sky start by that amount.')
 
     # ── Section 2: Sky IT with breaks replaced by NS ──
-    sky_trim = max(0.0, -sky_start_m)   # trim if show_start maps before master
+    sky_trim = max(0.0, -sky_start_m)
     sky_cur  = show_start + sky_trim
 
     inner = [(s, e) for s, e in breaks if s >= sky_cur]
@@ -121,7 +222,7 @@ def build_and_concat(sky_file, master_file, breaks, show_start,
 
         brk_dur  = brk_e - brk_s
         ms_start = mtime(brk_s)
-        ns_dur   = min(brk_dur, d_master - ms_start)   # don't overshoot master end
+        ns_dur   = min(brk_dur, d_master - ms_start)
         if ns_dur > 0:
             new_seg(master_file, ns_stream, ms_start, ns_dur,
                     f'[NS]  break  (master)')
@@ -155,10 +256,14 @@ def build_and_concat(sky_file, master_file, breaks, show_start,
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    dry_run = '--dry-run' in sys.argv
+    dry_run    = '--dry-run'    in sys.argv
+    sting_only = '--sting-only' in sys.argv
     if dry_run:
         sys.argv.remove('--dry-run')
         print('[DRY RUN] Detection and segment planning only -- no audio will be encoded.')
+    if sting_only:
+        sys.argv.remove('--sting-only')
+        print('[sting-only] Skipping PUBBLICITÀ and watermark fallback detection.')
 
     anchor_source = None
     anchor_master = None
@@ -171,7 +276,7 @@ def main():
             sys.argv.remove(arg)
 
     if anchor_source is None or anchor_master is None or len(sys.argv) != 4:
-        sys.exit('Usage: sync_sky_it.py [--dry-run] '
+        sys.exit('Usage: sync_sky_it.py [--dry-run] [--sting-only] '
                  '--anchor-source=S --anchor-master=S '
                  '<sky_it_file> <master.mkv> <output_dir>')
 
@@ -184,7 +289,7 @@ def main():
         sys.exit(f'ERROR: Missing fingerprint: {fp_leadin}')
 
     # ── Offset ──
-    offset = anchor_source - anchor_master   # master_time = sky_t - offset
+    offset = anchor_source - anchor_master
     print(f'Anchor: sky {fmt(anchor_source)} = master {fmt(anchor_master)}')
     print(f'Offset: {offset:.3f}s  (master_time = sky_time - {offset:.3f})')
 
@@ -199,28 +304,132 @@ def main():
     ns_stream = f'0:a:{n_audio - 1}'
     print(f'Master audio tracks: {n_audio}  ->  NS on {ns_stream}')
 
-    # ── Detect ad breaks via sting-pair detection ──
+    # ══════════════════════════════════════════════════════════════════════════
+    # TIER 1: Sting-pair detection (primary)
+    # ══════════════════════════════════════════════════════════════════════════
     print('\nScanning Sky IT for ad break stings...')
     events = find_all_transitions(sky_file, [fp_leadin], stream_spec='0:a:0')
 
     if not events:
-        print('  No transition events found -- treating as no-break source.')
-        breaks = []
+        print('  No sting events found.')
+        sting_breaks = []
     else:
         print(f'  {len(events)} sting events:')
         for t, c, d in events:
             print(f'    {fmt(t)}  conf={c:.4f}  clip_dur={d:.1f}s')
-        breaks = pair_breaks(events)
-        if breaks:
-            print(f'\n  {len(breaks)} ad breaks:')
-            for i, (s, e) in enumerate(breaks):
+        sting_breaks, used_offset_1 = pair_breaks(events)
+
+        # When the first sting is an orphaned lead-out, the preceding break's
+        # lead-in may have been missed due to the 30s suppression window
+        # (lead-in and lead-out too close together to both survive dedup).
+        # Re-scan with find_sting (no suppression) in the window before it.
+        if used_offset_1:
+            orphaned_t   = events[0][0]
+            orphaned_dur = events[0][2]
+            t_break_end  = orphaned_t + orphaned_dur
+            rescan_start = max(0.0, orphaned_t - MAX_BREAK_SECS)
+            rescan_dur   = orphaned_t - rescan_start - 10  # stop 10s before lead-out
+            if rescan_dur > 5:
+                print(f'\n  Rescanning before orphaned lead-out ({fmt(orphaned_t)}) '
+                      f'for missed lead-in...')
+                t_li, conf_li = find_sting(sky_file, fp_leadin,
+                                           rescan_start, rescan_dur,
+                                           stream_spec='0:a:0')
+                if conf_li >= 0.3:
+                    print(f'  Lead-in found at {fmt(t_li)} (conf={conf_li:.4f}); '
+                          f'adding break {fmt(t_li)}-{fmt(t_break_end)}')
+                    sting_breaks.insert(0, (t_li, t_break_end))
+                else:
+                    print(f'  No lead-in found before orphaned lead-out '
+                          f'(best conf={conf_li:.4f}).')
+
+        if sting_breaks:
+            print(f'\n  {len(sting_breaks)} sting-detected breaks:')
+            for i, (s, e) in enumerate(sting_breaks):
                 ms, me = s - offset, e - offset
                 print(f'    Break {i+1}: sky {fmt(s)}-{fmt(e)}  '
                       f'dur={e-s:.1f}s  master {fmt(ms)}-{fmt(me)}')
         else:
-            print('  No valid break pairs formed.')
+            print('  No valid sting pairs formed.')
 
-    # Show start: beginning of file (no pre-show assumed for Sky IT Sprint)
+    # ══════════════════════════════════════════════════════════════════════════
+    # TIER 2 + 3: PUBBLICITÀ (break start) + MGP watermark (break end)
+    # ══════════════════════════════════════════════════════════════════════════
+    fallback_breaks = []
+    if not sting_only:
+      print('\nBuilding templates for secondary detection...')
+      mgp_template  = build_watermark_template(
+          sky_file, ref_time=anchor_source,
+          wm_x=SKY_MGP_WM_X,  wm_y=SKY_MGP_WM_Y,
+          wm_w=SKY_MGP_WM_W,  wm_h=SKY_MGP_WM_H,
+          out_w=SKY_MGP_OUT_W, out_h=SKY_MGP_OUT_H)
+
+      # PUBBLICITÀ template: extracted from a frame where the text is visible.
+      # The text appears on the bumper clip at the start of every ad break.
+      pubb_ref = 1179.5   # seconds into this broadcast — adjust if clip changes
+      pubb_template = build_watermark_template(
+          sky_file, ref_time=pubb_ref,
+          wm_x=SKY_PUBB_X,     wm_y=SKY_PUBB_Y,
+          wm_w=SKY_PUBB_W,     wm_h=SKY_PUBB_H,
+          out_w=SKY_PUBB_OUT_W, out_h=SKY_PUBB_OUT_H)
+
+      if pubb_template is not None and mgp_template is not None:
+        print('\nScanning for PUBBLICITÀ text (secondary break-start detection)...')
+        pubb_hits = find_pubblicita_starts(
+            sky_file, pubb_template,
+            scan_start=0.0, scan_end=d_sky,
+            fps=1, thresh=SKY_PUBB_THRESH,
+            suppress_secs=SKY_PUBB_SUPPRESS_SECS)
+
+        if not pubb_hits:
+            print('  No PUBBLICITÀ detections found.')
+        else:
+            print(f'  {len(pubb_hits)} PUBBLICITÀ detection(s):')
+            for t, c in pubb_hits:
+                print(f'    {fmt(t)}  conf={c:.4f}')
+
+        for pubb_t, pubb_conf in pubb_hits:
+            # Skip if this start is already covered by a sting break
+            if any(s - 120 <= pubb_t <= e + 30 for s, e in sting_breaks):
+                print(f'  Skipping PUBBLICITÀ at {fmt(pubb_t)} '
+                      f'— covered by sting break')
+                continue
+
+            # Find break end via MGP watermark reappearance
+            print(f'  Finding break end for PUBBLICITÀ at {fmt(pubb_t)} '
+                  f'(conf={pubb_conf:.4f})...')
+            end_t, found = find_break_end_via_watermark(
+                sky_file,
+                break_start=pubb_t, clip_dur=0,
+                wm_template=mgp_template,
+                wm_x=SKY_MGP_WM_X,  wm_y=SKY_MGP_WM_Y,
+                wm_w=SKY_MGP_WM_W,  wm_h=SKY_MGP_WM_H,
+                out_w=SKY_MGP_OUT_W, out_h=SKY_MGP_OUT_H,
+                search_secs=MAX_BREAK_SECS, fps=2,
+                thresh=SKY_MGP_WM_THRESH,
+                min_offset_secs=SKY_MGP_WM_MIN_OFFSET,
+                wm_lag_secs=0.0)
+            if not found:
+                end_t = pubb_t + WM_FALLBACK_SECS
+                print(f'    Watermark not found; using {WM_FALLBACK_SECS:.0f}s fallback '
+                      f'→ end={fmt(end_t)}')
+            fallback_breaks.append((pubb_t, end_t))
+      else:
+          print('  WARNING: Could not build templates; skipping secondary detection.')
+
+    # ── Merge: sting breaks (primary) + PUBBLICITÀ/watermark (fallback) ──
+    breaks = sorted(sting_breaks + fallback_breaks)
+    if breaks:
+        print(f'\nFinal break list ({len(breaks)} breaks):')
+        for i, (s, e) in enumerate(breaks):
+            src = 'sting' if (s, e) in sting_breaks else 'fallback'
+            ms, me = s - offset, e - offset
+            print(f'  Break {i+1} [{src}]: sky {fmt(s)}-{fmt(e)}  '
+                  f'dur={e-s:.1f}s  master {fmt(ms)}-{fmt(me)}')
+    else:
+        print('\nNo breaks detected.')
+
+    # Show start: beginning of file (no pre-show trimming for Sky IT)
     show_start = 0.0
 
     print('\nBuilding output segments...')

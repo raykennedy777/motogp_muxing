@@ -3,9 +3,14 @@
 sync_sky_de.py
 Add Sky Sport DE German audio to a MotoGP master file.
 
-No lead-in/lead-out stings for ad breaks. Uses:
-  - Frame-based sync anchor (first camera change after race start)
-  - Watermark full-video scan to detect all ad breaks
+Break detection strategy:
+  1. Watermark full-video scan to detect ad break STARTS
+     (watermark disappears when ads begin)
+  2. Lead-out sting search to detect break ENDS (primary)
+     sky_de_leadout.wav — the jingle that plays as the broadcast returns
+     from ads; break end = sting_start + sting_duration.
+  3. Watermark reappearance (secondary fallback for break end)
+     Used when the sting is not found with sufficient confidence.
 
 Watermark: ~180x34 pixels at position (1040, 35) in 1280x720 video.
            Reappears ~3.44s after actual program resumption.
@@ -20,7 +25,7 @@ Output structure:
   3. Natural Sounds from master   sky_de_end_master       -> master end
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
-    (via audio_utils / watermark_detection modules)
+    (via audio_utils / sting_detection / watermark_detection modules)
 
 Usage:
     python sync_sky_de.py [--dry-run]
@@ -33,8 +38,13 @@ import sys
 from pathlib import Path
 
 from audio_utils import fmt, get_duration, get_audio_stream_count, \
-                        extract_seg, concat_segments_to_mka
+                        extract_seg, concat_segments_to_mka, load_fp_wav, SR
+from sting_detection import find_sting
 from watermark_detection import build_watermark_template, find_all_breaks_via_watermark
+
+FP_DIR         = Path(__file__).parent / 'fingerprints'
+MAX_BREAK_SECS = 420    # 7 min — sting search window upper bound
+STING_CONF_THRESH = 0.3 # minimum confidence to accept a lead-out sting hit
 
 # Sky DE watermark parameters (1280x720 source)
 WM_X     = 1040   # left edge
@@ -203,25 +213,79 @@ def main():
         sys.exit('ERROR: Could not build watermark template. Check file and coordinates.')
     print(f'  Template built from crop={WM_W}x{WM_H}@({WM_X},{WM_Y}) -> {WM_OUT_W}x{WM_OUT_H}')
 
-    # ── Scan for ad breaks via watermark ──
+    # ── Scan for ad break starts via watermark ──
     scan_start = program_start
     scan_end   = min(d_sky_de, offset + d_master)   # don't scan past master overlap
     print(f'\nScanning Sky DE for ad breaks via watermark ({fmt(scan_start)} to {fmt(scan_end)})...')
     print(f'  Watermark params: {WM_W}x{WM_H} at ({WM_X},{WM_Y})  lag={WM_LAG_SECS}s  thresh={WM_THRESH}')
 
-    breaks = find_all_breaks_via_watermark(
+    wm_breaks = find_all_breaks_via_watermark(
         sky_de_file, wm_template, WM_X, WM_Y, WM_W, WM_H,
         WM_OUT_W, WM_OUT_H,
         scan_start=scan_start, scan_end=scan_end,
         fps=WM_FPS, thresh=WM_THRESH,
         min_break_secs=MIN_BREAK_SECS, wm_lag_secs=WM_LAG_SECS)
 
-    print(f'\n  {len(breaks)} ad break(s) found:')
-    for i, (s, e) in enumerate(breaks):
-        ms, me = s - offset, e - offset
-        print(f'  Break {i+1}: sky_de {fmt(s)}-{fmt(e)}  '
-              f'dur={e-s:.1f}s  master {fmt(ms)}-{fmt(me)}')
+    # ── Refine break ends via lead-out sting (primary) ──
+    fp_leadout = str(FP_DIR / 'sky_de_leadout.wav')
+    leadout_exists = Path(fp_leadout).exists()
+    if leadout_exists:
+        sting_needle = load_fp_wav(fp_leadout)
+        sting_dur    = len(sting_needle) / SR
+        print(f'\nRefining break ends via lead-out sting ({fp_leadout}, {sting_dur:.2f}s)...')
+    else:
+        print(f'\nWARNING: Lead-out sting fingerprint not found ({fp_leadout}); '
+              f'using watermark for all break ends.')
 
+    breaks = []
+    for i, (brk_s, wm_brk_e) in enumerate(wm_breaks):
+        if leadout_exists:
+            search_start = brk_s + MIN_BREAK_SECS
+            search_end   = min(brk_s + MAX_BREAK_SECS, scan_end)
+            search_dur   = search_end - search_start
+            sting_t, sting_conf = find_sting(
+                sky_de_file, fp_leadout, search_start, search_dur,
+                stream_spec='0:a:0',
+                label=f'  Break {i+1} lead-out sting')
+            if sting_conf >= STING_CONF_THRESH:
+                brk_e = sting_t + sting_dur
+                method = f'sting (conf={sting_conf:.4f})'
+            else:
+                brk_e  = wm_brk_e
+                method = f'watermark fallback (sting conf={sting_conf:.4f} < {STING_CONF_THRESH})'
+        else:
+            brk_e  = wm_brk_e
+            method = 'watermark (no sting fingerprint)'
+        breaks.append((brk_s, brk_e))
+        ms, me = brk_s - offset, brk_e - offset
+        print(f'  Break {i+1}: sky_de {fmt(brk_s)}-{fmt(brk_e)}  '
+              f'dur={brk_e-brk_s:.1f}s  master {fmt(ms)}-{fmt(me)}  [{method}]')
+
+    # ── MotoGP 65s pre-race sting extension ──
+    fp_sting_gp = str(FP_DIR / 'prerace_sting_motogp.wav')
+    if breaks and Path(fp_sting_gp).exists():
+        print(f'\nSearching for 65s MotoGP pre-race sting...')
+        mgp_t, mgp_conf = find_sting(
+            sky_de_file, fp_sting_gp, scan_start, scan_end - scan_start,
+            stream_spec='0:a:0', label='  65s MotoGP sting')
+        if mgp_conf >= 0.3:
+            # Find the last break whose start is at or before the sting
+            last_idx = max((i for i, (s, _) in enumerate(breaks) if s <= mgp_t),
+                           default=-1)
+            if last_idx >= 0:
+                brk_s, brk_e = breaks[last_idx]
+                new_end = mgp_t + 65.0
+                if brk_e <= new_end:
+                    breaks[last_idx] = (brk_s, new_end)
+                    ms, me = brk_s - offset, new_end - offset
+                    print(f'  Extended break {last_idx + 1}: sky_de {fmt(brk_s)}-{fmt(new_end)}  '
+                          f'dur={new_end-brk_s:.1f}s  master {fmt(ms)}-{fmt(me)}')
+                else:
+                    print(f'  Break {last_idx + 1} already covers sting end; no extension needed.')
+        else:
+            print(f'  Not found (conf={mgp_conf:.4f}); no extension applied.')
+
+    print(f'\n{len(breaks)} ad break(s) detected.')
     print('\nBuilding output segments...')
     build_and_concat(sky_de_file, master_file, breaks, program_start,
                      offset, d_sky_de, d_master, ns_stream,

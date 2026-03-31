@@ -19,6 +19,7 @@ Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
 
 Usage:
     python sync_rts.py [--dry-run] [--trim-start S] [--trim-end S]
+                       [--src-sting-time S] [--master-sting-time S]
                        <rts_file> <master.mkv> <output_dir>
 """
 
@@ -124,6 +125,10 @@ def main():
                         help='Opening sting duration to replace with NS (seconds).')
     parser.add_argument('--trim-end',   type=float, default=0.0, metavar='S',
                         help='Closing sting duration to replace with NS (seconds).')
+    parser.add_argument('--src-sting-time', type=float, default=None, metavar='S',
+                        help='Override: known sting/anchor time in source (seconds). Skips detection.')
+    parser.add_argument('--master-sting-time', type=float, default=None, metavar='S',
+                        help='Override: known sting/anchor time in master (seconds). Skips detection.')
     parser.add_argument('rts_file')
     parser.add_argument('master_file')
     parser.add_argument('output_dir')
@@ -153,24 +158,32 @@ def main():
     print(f'Master audio tracks: {n_audio}  ->  Natural Sounds on {ns_stream}')
 
     # ── Find pre-race sting in master ──
-    print('\nLocating 65s sting in master...')
-    master_sting, master_conf = find_sting(
-        args.master_file, fp_sting,
-        *STING_SEARCH_MASTER, stream_spec=ns_stream,
-        label='  Sting (master)')
-    if master_conf < 0.1:
-        sys.exit('ERROR: Could not find pre-race sting in master. '
-                 'Check fingerprint or STING_SEARCH_MASTER window.')
+    if args.master_sting_time is not None:
+        master_sting = args.master_sting_time
+        print(f'\nMaster anchor: {master_sting:.3f}s (manual override)')
+    else:
+        print('\nLocating 65s sting in master...')
+        master_sting, master_conf = find_sting(
+            args.master_file, fp_sting,
+            *STING_SEARCH_MASTER, stream_spec=ns_stream,
+            label='  Sting (master)')
+        if master_conf < 0.1:
+            sys.exit('ERROR: Could not find pre-race sting in master. '
+                     'Check fingerprint or STING_SEARCH_MASTER window.')
 
     # ── Find pre-race sting in RTS source ──
-    print('\nLocating 65s sting in RTS source...')
-    src_sting, src_conf = find_sting(
-        args.rts_file, fp_sting,
-        *STING_SEARCH_SRC, stream_spec='0:a:0',
-        label='  Sting (RTS)')
-    if src_conf < 0.1:
-        sys.exit('ERROR: Could not find pre-race sting in RTS file. '
-                 'Check fingerprint or STING_SEARCH_SRC window.')
+    if args.src_sting_time is not None:
+        src_sting = args.src_sting_time
+        print(f'Source anchor: {src_sting:.3f}s (manual override)')
+    else:
+        print('\nLocating 65s sting in RTS source...')
+        src_sting, src_conf = find_sting(
+            args.rts_file, fp_sting,
+            *STING_SEARCH_SRC, stream_spec='0:a:0',
+            label='  Sting (RTS)')
+        if src_conf < 0.1:
+            sys.exit('ERROR: Could not find pre-race sting in RTS file. '
+                     'Check fingerprint or STING_SEARCH_SRC window.')
 
     # ── Build output ──
     print('\nBuilding output segments...')

@@ -60,6 +60,10 @@ WM_OUT_W            = 64    # downscaled width for template matching
 WM_OUT_H            = 32    # downscaled height for template matching
 WATERMARK_THRESH    = 0.44  # Pearson correlation threshold
 WATERMARK_FPS       = 2     # frames per second to sample during break-end scan
+# DAZN watermark lag: the DAZN watermark reappears ~58.3s BEFORE actual content resumes
+# (the logo is shown over the final seconds of the ad reel).
+# break_end = watermark_time - DAZN_WM_LAG_SECS  →  negative lag pushes break_end later.
+DAZN_WM_LAG_SECS    = -58.3
 
 # Fingerprints directory (alongside this script)
 FP_DIR = Path(__file__).parent / 'fingerprints'
@@ -104,7 +108,7 @@ def detect_breaks_dazn(dazn, fp_list, fp_showintro_list, showintro_dur,
     Detect ad breaks in DAZN broadcast.
     Break-end detection hierarchy:
       1. Show intro sting fingerprint
-      2. Watermark reappearance in video (all breaks; break end = watermark time - 4s)
+      2. Watermark reappearance in video (all breaks; break end = watermark time - DAZN_WM_LAG_SECS)
       3. DAZN_FALLBACK_BREAK_SECS (73s) last resort
     Returns list of (break_start, break_end) in DAZN time.
     """
@@ -128,7 +132,8 @@ def detect_breaks_dazn(dazn, fp_list, fp_showintro_list, showintro_dur,
                 wm_x, wm_y, wm_w, wm_h,
                 WM_OUT_W, WM_OUT_H,
                 search_secs=WM_SEARCH_SECS, fps=WATERMARK_FPS,
-                thresh=WATERMARK_THRESH, min_offset_secs=WM_MIN_OFFSET_SECS)
+                thresh=WATERMARK_THRESH, min_offset_secs=WM_MIN_OFFSET_SECS,
+                wm_lag_secs=DAZN_WM_LAG_SECS)
             if wm_found:
                 end   = wm_end
                 found = True
@@ -214,6 +219,10 @@ def build_and_concat(dazn, web_master, breaks,
     dazn_cur = pre_break_end_dazn
 
     for brk_s, brk_e in inner:
+        if brk_s < dazn_cur:
+            print(f'  Skipping overlapping break {brk_s:.1f}s-{brk_e:.1f}s '
+                  f'(starts before current pos {dazn_cur:.1f}s)')
+            continue
         # DAZN segment before this break
         dazn_dur   = brk_s - dazn_cur
         master_end = mtime(brk_s)
@@ -275,6 +284,7 @@ def main():
     sprint_mode        = '--sprint' in sys.argv
     anchor_source      = None
     anchor_master      = None
+    program_start      = None
     if sprint_mode:
         sys.argv.remove('--sprint')
     for arg in list(sys.argv[1:]):
@@ -290,12 +300,15 @@ def main():
         elif arg.startswith('--anchor-master='):
             anchor_master = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
+        elif arg.startswith('--program-start='):
+            program_start = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
     if sprint_mode and (anchor_source is None or anchor_master is None):
         sys.exit('ERROR: --sprint requires --anchor-source=S and --anchor-master=S')
 
     if len(sys.argv) != 4:
         sys.exit('Usage: sync_dazn.py [--dry-run] [--mgp-sting-dazn=S] [--m3-dazn=S] '
-                 '[--sprint --anchor-source=S --anchor-master=S] '
+                 '[--sprint --anchor-source=S --anchor-master=S [--program-start=S]] '
                  '<dazn_file> <web_master.mkv> <output_dir>')
 
     dazn_file, web_master, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -389,12 +402,16 @@ def main():
             print(f'\nShow-start break: DAZN {fmt(pre_breaks[0][0])}-{fmt(pre_break_end_dazn)}')
             print(f'  DAZN commentary starts at DAZN {fmt(pre_break_end_dazn)} '
                   f'= master {fmt(pre_break_end_dazn - offset)}')
+        elif program_start is not None:
+            pre_break_end_dazn = program_start
+            print(f'\nNo pre-anchor break found; using --program-start: '
+                  f'DAZN {fmt(program_start)} = master {fmt(program_start - offset)}')
         else:
             pre_break_end_dazn = offset   # start at master t=0
             print(f'\nNo pre-anchor break found; DAZN starts concurrently with master.')
 
-        # Sprint: run to master end (no end-program sting)
-        end_sting_dazn = offset + d_web
+        # Sprint: cap at DAZN file end so NS fills any gap to master end
+        end_sting_dazn = min(offset + d_web, d_dazn)
 
     else:
         # ── Sunday mode: full multi-race detection ──
