@@ -10,7 +10,7 @@ from scipy.signal import fftconvolve
 
 from audio_utils import SR, get_duration, extract_wav, load_fp_wav, _peak
 
-CONF_THRESH    = 0.5    # minimum confidence to accept a transition hit
+CONF_THRESH    = 0.25   # minimum confidence to accept a transition hit
 SUPPRESS_SECS  = 30     # deduplicate transition hits within this window (seconds)
 MIN_EVENT_SECS = 120    # ignore transition hits in the first 2 minutes (broadcast intro)
 
@@ -28,7 +28,8 @@ def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
         return search_start, 0.0
     extract_wav(src, tmp, stream_spec, start=search_start, duration=actual_dur)
     haystack = load_fp_wav(tmp)
-    os.remove(tmp)
+    if os.path.exists(tmp):
+        os.remove(tmp)
     needle = load_fp_wav(fp_path)
     idx, conf = _peak(haystack, needle)
     t = search_start + idx / SR

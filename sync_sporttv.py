@@ -335,7 +335,7 @@ def main():
 
     fp_sting    = str(FP_DIR / 'prerace_sting.wav')
     fp_sting_gp = str(FP_DIR / 'prerace_sting_motogp.wav')
-    fp_preshow  = str(FP_DIR / 'preshow_intro_m2m3.mka')
+    fp_preshow  = str(FP_DIR / 'preshow_intro_m2m3.wav')
     fp_leadin   = str(FP_DIR / 'sporttv_leadin.mka')
 
     for fp in [fp_sting, fp_sting_gp, fp_preshow, fp_leadin]:

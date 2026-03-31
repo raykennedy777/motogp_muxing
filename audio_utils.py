@@ -8,9 +8,29 @@ for MotoGP sync scripts.
 import subprocess, os, numpy as np
 from pathlib import Path
 from scipy.io import wavfile
-from scipy.signal import fftconvolve
+from scipy.signal import fftconvolve, butter, filtfilt
 
 SR = 8000   # Hz for correlation
+
+# Multi-band correlation bands: (low_hz, high_hz, weight)
+MULTIBANDS = [
+    (80,   300,  0.2),   # low: engine rumble, bass stings
+    (300, 3000,  0.6),   # mid: commentary, most sting energy
+    (3000, 4000, 0.2),   # high: sibilance, high-frequency harmonics
+]
+MULTIBAND_TOLERANCE = 50  # samples (~6ms at 8kHz) for index agreement
+MULTIBAND_MIN_AGREE = 2   # need this many bands to agree
+
+
+def _bandpass(data, low, high, fs, order=4):
+    """Zero-phase bandpass filter."""
+    nyq = fs / 2.0
+    lo  = max(0.1, low / nyq)
+    hi  = min(0.99, high / nyq)
+    if lo >= hi:
+        return data
+    b, a = butter(order, [lo, hi], btype='band')
+    return filtfilt(b, a, data)
 
 
 def get_duration(f):
@@ -63,15 +83,73 @@ def load_fp_wav(path, sr=SR):
 
 
 def _peak(haystack, needle):
-    """Return (sample_index, confidence) for best match of needle in haystack."""
+    """Return (sample_index, confidence) for best match of needle in haystack.
+    Uses RMS pre-normalization + multi-band correlation for robustness."""
     h = haystack.astype(np.float32)
     n = needle.astype(np.float32)
+
+    # RMS pre-normalize both signals
+    h = h / (np.sqrt(np.mean(h**2)) + 1e-10)
+    n = n / (np.sqrt(np.mean(n**2)) + 1e-10)
+
     if len(n) >= len(h):
         n = n[:max(1, len(h) - 1)]
+
+    # Full-band correlation first (for confidence at agreed position)
     corr  = fftconvolve(h, n[::-1], mode='valid')
-    idx   = int(np.argmax(np.abs(corr)))
+    abs_c = np.abs(corr)
+
+    # Multi-band correlation to find agreed position
+    band_results = []
+    for lo, hi, _w in MULTIBANDS:
+        h_b = _bandpass(h, lo, hi, SR)
+        n_b = _bandpass(n, lo, hi, SR)
+        if len(h_b) < len(n_b) + 1:
+            continue
+        c = fftconvolve(h_b, n_b[::-1], mode='valid')
+        idx_b = int(np.argmax(np.abs(c)))
+        h_win = h_b[idx_b:idx_b + len(n_b)]
+        conf_b = float(np.abs(c[idx_b])) / (
+                 np.linalg.norm(h_win) * np.linalg.norm(n_b) + 1e-10)
+        band_results.append((idx_b, conf_b, hi - lo))
+
+    if len(band_results) >= MULTIBAND_MIN_AGREE:
+        # Pairwise agreement: find the largest agreeing subset
+        indices = [r[0] for r in band_results]
+        best_subset = None
+        best_weight = 0
+        for i in range(len(indices)):
+            subset = [i]
+            for j in range(i + 1, len(indices)):
+                if abs(indices[j] - indices[i]) <= MULTIBAND_TOLERANCE:
+                    subset.append(j)
+            weight = sum(MULTIBANDS[k][2] for k in subset)
+            if len(subset) >= MULTIBAND_MIN_AGREE and weight > best_weight:
+                best_subset = subset
+                best_weight = weight
+
+        if best_subset is not None:
+            agreed = int(round(np.mean([band_results[k][0] for k in best_subset])))
+            # Search full-band peak near the agreed position (within tolerance)
+            lo = max(0, agreed - MULTIBAND_TOLERANCE)
+            hi = min(len(abs_c), agreed + MULTIBAND_TOLERANCE)
+            idx = lo + int(np.argmax(abs_c[lo:hi]))
+            h_win = h[idx:idx + len(n)]
+            conf = float(abs_c[idx]) / (
+                   np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
+            return idx, conf
+
+    # Fallback: full-band peak
+    idx   = int(np.argmax(abs_c))
     h_win = h[idx:idx + len(n)]
-    conf  = float(np.abs(corr[idx])) / (
+    conf  = float(abs_c[idx]) / (
+            np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
+    return idx, conf
+
+    # Fallback: full-band peak
+    idx   = int(np.argmax(abs_c))
+    h_win = h[idx:idx + len(n)]
+    conf  = float(abs_c[idx]) / (
             np.linalg.norm(h_win) * np.linalg.norm(n) + 1e-10)
     return idx, conf
 
