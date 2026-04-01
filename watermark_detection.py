@@ -26,20 +26,16 @@ def build_watermark_template(src, ref_time, wm_x, wm_y, wm_w, wm_h,
     ref_time must be during confirmed live on-track coverage (watermark present).
     Returns a flat float32 array of out_w*out_h pixels, or None on failure.
     """
-    tmp = f'_tmp_wm_template{tmp_suffix}.raw'
     try:
-        subprocess.run(
+        result = subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{ref_time:.3f}', '-i', str(src), '-frames:v', '1',
              '-vf', f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},scale={out_w}:{out_h}',
-             '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
-            check=True)
-        arr = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
-        os.remove(tmp)
+             '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
+            check=True, capture_output=True)
+        arr = np.frombuffer(result.stdout, dtype=np.uint8).astype(np.float32)
     except Exception as e:
         print(f'  WARNING: Could not extract watermark template: {e}')
-        if os.path.exists(tmp):
-            os.remove(tmp)
         return None
     n = out_w * out_h
     return arr[:n] if len(arr) >= n else None
@@ -104,9 +100,10 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
       Positive (default 4.0): watermark appears AFTER content resumes (break_end is before watermark).
       Negative (e.g. -58.3): watermark appears BEFORE content resumes (break_end is after watermark).
     """
+    import time
     search_start = break_start + clip_dur
     n_pixels = out_w * out_h
-    tmp = f'_tmp_wm_probe{tmp_suffix}.raw'
+    tmp = f'/tmp/_tmp_wm_probe_{int(time.time()*1000)}{tmp_suffix}.raw'
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
@@ -117,6 +114,14 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
                      f'scale={out_w}:{out_h}'),
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
+        # WSL interop timing
+        for _ in range(10):
+            if os.path.exists(tmp):
+                break
+            time.sleep(0.2)
+        if not os.path.exists(tmp):
+            print(f'  WARNING: Watermark probe: file not created')
+            return None, False
         frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
         os.remove(tmp)
     except Exception as e:
@@ -148,6 +153,90 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
 
     print(f'    Watermark not found (max={max_conf:.3f} at t={max_conf_t:.1f}s, '
           f'+{max_conf_t - search_start:.0f}s from search start)')
+    return None, False
+
+
+def find_break_start_via_watermark(src, sting_time, wm_template,
+                                   wm_x, wm_y, wm_w, wm_h,
+                                   out_w, out_h,
+                                   search_secs=300, fps=2,
+                                   thresh=0.44, tmp_suffix=''):
+    """
+    Detect break start by scanning BACKWARD from a sting time to find when
+    the watermark disappeared (correlation drops below threshold).
+
+    Returns (break_start_sec, found_bool).
+    """
+    import time
+    search_start = max(0.0, sting_time - search_secs)
+    search_dur = sting_time - search_start
+    n_pixels = out_w * out_h
+    tmp = f'/tmp/_tmp_wm_break_start_{int(time.time()*1000)}{tmp_suffix}.raw'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+             '-ss', f'{search_start:.3f}', '-t', f'{search_dur:.1f}',
+             '-i', str(src),
+             '-vf', (f'fps={fps},'
+                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},'
+                     f'scale={out_w}:{out_h}'),
+             '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
+            check=True)
+        for _ in range(10):
+            if os.path.exists(tmp):
+                break
+            time.sleep(0.2)
+        if not os.path.exists(tmp):
+            print(f'  WARNING: break start scan: file not created')
+            return None, False
+        frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
+        os.remove(tmp)
+    except Exception as e:
+        print(f'  WARNING: break start scan failed: {e}')
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return None, False
+
+    n_frames = len(frames) // n_pixels
+    if n_frames == 0:
+        return None, False
+
+    step = 1.0 / fps
+    t0 = wm_template - wm_template.mean()
+    t0_norm = np.linalg.norm(t0)
+
+    last_visible_t = None
+    in_break = False
+
+    for i in range(n_frames):
+        frame = frames[i * n_pixels:(i + 1) * n_pixels]
+        f0 = frame - frame.mean()
+        conf = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
+        t_i = search_start + i * step
+
+        if not in_break:
+            if conf >= thresh:
+                last_visible_t = t_i
+            else:
+                in_break = True
+
+    if last_visible_t is not None:
+        for i in range(n_frames - 1, -1, -1):
+            frame = frames[i * n_pixels:(i + 1) * n_pixels]
+            f0 = frame - frame.mean()
+            conf = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
+            t_i = search_start + i * step
+            if conf >= thresh and t_i <= last_visible_t:
+                break_start = t_i + step
+                print(f'    Break start (WM disappeared): {break_start:.1f}s '
+                      f'(last visible at {t_i:.1f}s, conf={conf:.3f})')
+                return break_start, True
+
+        break_start = last_visible_t + 1.0
+        print(f'    Break start (fallback): {break_start:.1f}s')
+        return break_start, True
+
+    print(f'    Watermark never visible in scan window')
     return None, False
 
 

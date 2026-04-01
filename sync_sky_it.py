@@ -46,7 +46,8 @@ from pathlib import Path
 from audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
 from sting_detection import find_all_transitions, find_sting
-from watermark_detection import build_watermark_template, find_break_end_via_watermark
+from watermark_detection import build_watermark_template, find_break_end_via_watermark, \
+                                find_break_start_via_watermark
 
 FP_DIR         = Path(__file__).parent / 'fingerprints'
 MAX_BREAK_SECS = 420    # 7 min — discard sting pairings longer than this
@@ -118,7 +119,8 @@ def find_pubblicita_starts(src, template, scan_start=0.0, scan_end=0.0,
         return []
 
     n_pixels = SKY_PUBB_OUT_W * SKY_PUBB_OUT_H
-    tmp = '_tmp_pubb_scan.raw'
+    import time
+    tmp = f'/tmp/_tmp_pubb_scan_{int(time.time()*1000)}.raw'
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
@@ -128,6 +130,14 @@ def find_pubblicita_starts(src, template, scan_start=0.0, scan_end=0.0,
                      f'scale={SKY_PUBB_OUT_W}:{SKY_PUBB_OUT_H}'),
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
+        # WSL interop timing
+        for _ in range(10):
+            if os.path.exists(tmp):
+                break
+            time.sleep(0.2)
+        if not os.path.exists(tmp):
+            print(f'  WARNING: PUBBLICITÀ scan: file not created (WSL timing issue)')
+            return []
         frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
         os.remove(tmp)
     except Exception as e:
@@ -310,9 +320,11 @@ def main():
     print('\nScanning Sky IT for ad break stings...')
     events = find_all_transitions(sky_file, [fp_leadin], stream_spec='0:a:0')
 
+    sting_breaks = []
+    unpaired_stings = []
+
     if not events:
         print('  No sting events found.')
-        sting_breaks = []
     else:
         print(f'  {len(events)} sting events:')
         for t, c, d in events:
@@ -320,7 +332,7 @@ def main():
         sting_breaks, used_offset_1 = pair_breaks(events)
 
         # When the first sting is an orphaned lead-out, the preceding break's
-        # lead-in may have been missed due to the 30s suppression window
+        # lead-in may have been missed due to the suppression window
         # (lead-in and lead-out too close together to both survive dedup).
         # Re-scan with find_sting (no suppression) in the window before it.
         if used_offset_1:
@@ -352,8 +364,20 @@ def main():
         else:
             print('  No valid sting pairs formed.')
 
+        # Identify unpaired stings for watermark-based break start detection
+        paired_times = set()
+        for s, e in sting_breaks:
+            paired_times.add(s)
+            paired_times.add(e)
+        unpaired_stings = [(t, c, d) for t, c, d in events if t not in paired_times]
+        if unpaired_stings:
+            print(f'\n  {len(unpaired_stings)} unpaired sting(s):')
+            for t, c, d in unpaired_stings:
+                print(f'    {fmt(t)}  conf={c:.4f}  clip_dur={d:.1f}s')
+
     # ══════════════════════════════════════════════════════════════════════════
     # TIER 2 + 3: PUBBLICITÀ (break start) + MGP watermark (break end)
+    # Only scan near unpaired stings (300s window before each)
     # ══════════════════════════════════════════════════════════════════════════
     fallback_breaks = []
     if not sting_only:
@@ -374,50 +398,58 @@ def main():
           out_w=SKY_PUBB_OUT_W, out_h=SKY_PUBB_OUT_H)
 
       if pubb_template is not None and mgp_template is not None:
-        print('\nScanning for PUBBLICITÀ text (secondary break-start detection)...')
-        pubb_hits = find_pubblicita_starts(
-            sky_file, pubb_template,
-            scan_start=0.0, scan_end=d_sky,
-            fps=1, thresh=SKY_PUBB_THRESH,
-            suppress_secs=SKY_PUBB_SUPPRESS_SECS)
+        # Only scan for PUBBLICITÀ near unpaired stings
+        pubb_used_times = set()  # Track PUBBLICITÀ times already used
+        for t_sting, conf, clip_dur in unpaired_stings:
+          # Skip if already covered by a sting break
+          if any(s - 60 <= t_sting <= e + 30 for s, e in sting_breaks):
+            continue
 
-        if not pubb_hits:
-            print('  No PUBBLICITÀ detections found.')
-        else:
-            print(f'  {len(pubb_hits)} PUBBLICITÀ detection(s):')
-            for t, c in pubb_hits:
-                print(f'    {fmt(t)}  conf={c:.4f}')
+          # Scan 300s before the unpaired sting for PUBBLICITÀ
+          scan_start = max(0.0, t_sting - 300.0)
+          scan_end = t_sting
+          print(f'\n  Scanning for PUBBLICITÀ before unpaired sting at {fmt(t_sting)}...')
+          pubb_hits = find_pubblicita_starts(
+              sky_file, pubb_template,
+              scan_start=scan_start, scan_end=scan_end,
+              fps=1, thresh=SKY_PUBB_THRESH,
+              suppress_secs=SKY_PUBB_SUPPRESS_SECS)
 
-        for pubb_t, pubb_conf in pubb_hits:
-            # Skip if this start is already covered by a sting break
-            if any(s - 120 <= pubb_t <= e + 30 for s, e in sting_breaks):
-                print(f'  Skipping PUBBLICITÀ at {fmt(pubb_t)} '
-                      f'— covered by sting break')
-                continue
+          # Filter out PUBBLICITÀ times already used
+          pubb_hits = [(t, c) for t, c in pubb_hits
+                       if not any(abs(t - used) < 30 for used in pubb_used_times)]
+          # Filter out PUBBLICITÀ too close to file start (pre-show bumpers)
+          pubb_hits = [(t, c) for t, c in pubb_hits if t >= 60.0]
+          # Filter out PUBBLICITÀ too close to file start (pre-show bumpers)
+          pubb_hits = [(t, c) for t, c in pubb_hits if t >= 60.0]
 
-            # Find break end via MGP watermark reappearance
-            print(f'  Finding break end for PUBBLICITÀ at {fmt(pubb_t)} '
-                  f'(conf={pubb_conf:.4f})...')
-            end_t, found = find_break_end_via_watermark(
-                sky_file,
-                break_start=pubb_t, clip_dur=0,
-                wm_template=mgp_template,
-                wm_x=SKY_MGP_WM_X,  wm_y=SKY_MGP_WM_Y,
-                wm_w=SKY_MGP_WM_W,  wm_h=SKY_MGP_WM_H,
-                out_w=SKY_MGP_OUT_W, out_h=SKY_MGP_OUT_H,
-                search_secs=MAX_BREAK_SECS, fps=2,
-                thresh=SKY_MGP_WM_THRESH,
-                min_offset_secs=SKY_MGP_WM_MIN_OFFSET,
-                wm_lag_secs=0.0)
-            if not found:
-                end_t = pubb_t + WM_FALLBACK_SECS
-                print(f'    Watermark not found; using {WM_FALLBACK_SECS:.0f}s fallback '
-                      f'→ end={fmt(end_t)}')
+          if not pubb_hits:
+            print(f'    No PUBBLICITÀ found in {fmt(scan_start)}-{fmt(scan_end)}')
+            continue
+
+          # Use the latest PUBBLICITÀ hit (closest to the sting)
+          pubb_t, pubb_conf = pubb_hits[-1]
+          pubb_used_times.add(pubb_t)
+          print(f'    PUBBLICITÀ at {fmt(pubb_t)} (conf={pubb_conf:.4f})')
+
+          # Find break end: search for sting AFTER PUBBLICITÀ (primary)
+          print(f'    Searching for sting after PUBBLICITÀ (within {MAX_BREAK_SECS}s)...')
+          end_t, end_conf = find_sting(
+              sky_file, fp_leadin,
+              search_start=pubb_t + 5.0,  # skip 5s after PUBBLICITÀ
+              search_dur=MAX_BREAK_SECS,
+              stream_spec='0:a:0',
+              label=f'    Sting after PUBBLICITÀ')
+
+          if end_conf >= 0.3:
+            print(f'    Sting found at {fmt(end_t)} (conf={end_conf:.4f}) — break end')
             fallback_breaks.append((pubb_t, end_t))
+          else:
+            print(f'    No sting found after PUBBLICITÀ; skipping this break')
       else:
           print('  WARNING: Could not build templates; skipping secondary detection.')
 
-    # ── Merge: sting breaks (primary) + PUBBLICITÀ/watermark (fallback) ──
+    # ── Merge: sting breaks (primary) + PUBBLICITÀ/sting (fallback) ──
     breaks = sorted(sting_breaks + fallback_breaks)
     if breaks:
         print(f'\nFinal break list ({len(breaks)} breaks):')
