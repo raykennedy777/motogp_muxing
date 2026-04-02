@@ -102,10 +102,15 @@ def build_and_concat(tnt, web_master, breaks,
                 '[NS]  pre-Moto3 (master 0)')
 
     # ── Section 2: TNT bulk with breaks replaced by NS ──
+    # If TNT starts before master t=0 (offset > pre_break_end_tnt), skip the preshow
+    # so the output length matches the master and the NS tail stays in sync.
+    tnt_start = max(pre_break_end_tnt, offset)
+    if tnt_start > pre_break_end_tnt:
+        print(f'  [Skipping {fmt(tnt_start - pre_break_end_tnt)} of TNT preshow before master t=0]')
     inner = [(s, e) for s, e in breaks
-             if s >= pre_break_end_tnt and s < post_gp_break_start_tnt]
+             if s >= tnt_start and s < post_gp_break_start_tnt]
 
-    tnt_cur = pre_break_end_tnt
+    tnt_cur = tnt_start
 
     for brk_s, brk_e in inner:
         # TNT segment before this break
@@ -173,6 +178,7 @@ def main():
     sting_tnt_override = None
     ns_track        = '0:a:1'
     manual_breaks   = []
+    file_label      = ''
     for arg in list(sys.argv[1:]):
         if arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
@@ -190,15 +196,19 @@ def main():
             s, e = arg.split('=', 1)[1].split(':')
             manual_breaks.append((float(s), float(e)))
             sys.argv.remove(arg)
+        elif arg.startswith('--label='):
+            file_label = arg.split('=', 1)[1]
+            sys.argv.remove(arg)
 
     if len(sys.argv) != 4:
         sys.exit('Usage: sync_tnt.py [--dry-run] [--motogp] '
                  '[--anchor-source=S --anchor-master=S] '
-                 '[--ns-track=STREAM] [--sting-tnt=S] [--break=S:E] '
+                 '[--ns-track=STREAM] [--sting-tnt=S] [--break=S:E] [--label=LABEL] '
                  '<tnt_file> <web_master.mkv> <output_dir>')
 
     tnt_file, web_master, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    output_mka = Path(out_dir) / (Path(tnt_file).stem + '_synced.mka')
+    label_part = f'_{file_label}' if file_label else ''
+    output_mka = Path(out_dir) / (Path(tnt_file).stem + label_part + '_synced.mka')
 
     fp_sting      = str(FP_DIR / 'prerace_sting.wav')
     fp_sting_gp   = str(FP_DIR / 'prerace_sting_motogp.wav')
@@ -296,8 +306,16 @@ def main():
         print(f'\nNo pre-race break found; TNT commentary starts at t=0 '
               f'= master {fmt(-offset)}')
 
-    # ── Post-race boundary: master end (NS tail covers remainder) ──
-    post_gp_break_start_tnt = offset + d_web
+    # ── Post-race boundary ──
+    # If the last event is unpaired (orphaned lead-in = file ended mid-break),
+    # treat that as the end of commentary and fill the remainder with NS.
+    if events and len(events) % 2 == 1:
+        orphaned_tnt = events[-1][0]
+        post_gp_break_start_tnt = orphaned_tnt
+        print(f'\nOrphaned lead-in at {fmt(orphaned_tnt)} '
+              f'(unpaired) — NS from master {fmt(orphaned_tnt - offset)} to end')
+    else:
+        post_gp_break_start_tnt = offset + d_web
 
     # ── Build output ──
     print('\nBuilding output segments...')

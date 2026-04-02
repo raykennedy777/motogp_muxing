@@ -6,10 +6,14 @@ Add Sky Sport DE German audio to a MotoGP master file.
 Break detection strategy:
   1. Watermark full-video scan to detect ad break STARTS
      (watermark disappears when ads begin)
-  2. Lead-out sting search to detect break ENDS (primary)
+  2. If correlation scan finds 0 breaks, falls back to std-based detection:
+     - AD frames: wm_std < 8 (solid graphics, black/white bars)
+     - Break content: wm_std > 85 (bumpers, promos during breaks)
+     - Merges regions with 30s gap tolerance
+  3. Lead-out sting search to detect break ENDS (primary)
      sky_de_leadout.wav — the jingle that plays as the broadcast returns
      from ads; break end = sting_start + sting_duration.
-  3. Watermark reappearance (secondary fallback for break end)
+  4. Watermark reappearance (secondary fallback for break end)
      Used when the sting is not found with sufficient confidence.
 
 Watermark: ~180x34 pixels at position (1040, 35) in 1280x720 video.
@@ -41,6 +45,8 @@ from audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka, load_fp_wav, SR
 from sting_detection import find_sting
 from watermark_detection import build_watermark_template, find_all_breaks_via_watermark
+import subprocess
+import numpy as np
 
 FP_DIR         = Path(__file__).parent / 'fingerprints'
 MAX_BREAK_SECS = 420    # 7 min — sting search window upper bound
@@ -60,6 +66,147 @@ WM_LAG_SECS = 3.44
 WM_THRESH      = 0.44
 WM_FPS         = 2
 MIN_BREAK_SECS = 45
+
+# Std-based detection thresholds (primary detector)
+STD_AD_THRESH            = 8    # wm_std < 8 → ad frame (solid graphics/bars)
+STD_BREAK_CONTENT_THRESH = 85   # wm_std > 85 → break content (bumpers/promos)
+STD_MERGE_GAP            = 30   # max gap between ad/break_content frames to merge
+STD_SCAN_FPS             = 2    # scan fps for std-based detection
+
+# Validation thresholds
+# Breaks are accepted if: sting confirmed (conf >= STING_CONF_THRESH) and
+# std_end is within STING_END_TOLERANCE of sting_end, OR no sting and
+# duration >= STD_CONFIRMED_MIN_SECS.
+STD_CONFIRMED_MIN_SECS = 150  # min duration to accept a break without sting
+STING_END_TOLERANCE    = 60   # max gap (s) between std end and sting end
+
+
+# ── Std-based break detection (fallback) ───────────────────────────────────────
+
+def find_breaks_via_std(src, scan_start, scan_end, wm_x, wm_y, wm_w, wm_h,
+                         fps=STD_SCAN_FPS, min_break_secs=MIN_BREAK_SECS,
+                         merge_gap_secs=STD_MERGE_GAP, tmp_suffix=''):
+    """
+    Std-based break detection fallback when correlation-based scan fails.
+
+    Classifies frames:
+      - AD: wm_std < STD_AD_THRESH (solid graphics, black/white bars)
+      - BREAK_CONTENT: wm_std > STD_BREAK_CONTENT_THRESH (bumpers, promos)
+      - CONTENT: everything else (normal programming)
+
+    Merges AD and BREAK_CONTENT regions with merge_gap_secs tolerance.
+    Returns list of (break_start, break_end) tuples.
+    """
+    scan_dur = max(0.0, scan_end - scan_start)
+    if scan_dur <= 0:
+        return []
+
+    n_pixels = WM_OUT_W * WM_OUT_H  # scaled size, not original crop size
+    tmp = f'_tmp_std_scan{tmp_suffix}.raw'
+
+    print(f'\n  Std-based scan: {fps}fps, AD std<{STD_AD_THRESH}, '
+          f'break_content std>{STD_BREAK_CONTENT_THRESH}')
+
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+             '-ss', f'{scan_start:.3f}', '-t', f'{scan_dur:.0f}',
+             '-i', str(src),
+             '-vf', (f'fps={fps},'
+                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},'
+                     f'scale={WM_OUT_W}:{WM_OUT_H}'),
+             '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
+            check=True)
+        frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
+        if Path(tmp).exists():
+            Path(tmp).unlink()
+    except Exception as e:
+        print(f'  WARNING: Std-based scan failed: {e}')
+        if Path(tmp).exists():
+            Path(tmp).unlink()
+        return []
+
+    n_frames = len(frames) // n_pixels
+    if n_frames == 0:
+        print('  WARNING: Std-based scan produced no frames.')
+        return []
+
+    step = 1.0 / fps
+
+    # Classify each frame
+    classifications = []  # list of (time, type) where type is 'ad', 'break_content', or 'content'
+    for i in range(n_frames):
+        frame = frames[i * n_pixels:(i + 1) * n_pixels]
+        std = frame.std()
+        t_i = scan_start + i * step
+
+        if std < STD_AD_THRESH:
+            cls = 'ad'
+        elif std > STD_BREAK_CONTENT_THRESH:
+            cls = 'break_content'
+        else:
+            cls = 'content'
+        classifications.append((t_i, cls))
+
+    # Find contiguous regions of ad/break_content
+    # Allow merging across content gaps <= merge_gap_secs
+    breaks = []
+    in_break = False
+    break_start = None
+    last_inbreak_time = None
+    gap_start = None
+
+    for t_i, cls in classifications:
+        is_inbreak = cls in ('ad', 'break_content')
+
+        if is_inbreak:
+            if not in_break:
+                # Start of new break
+                in_break = True
+                break_start = t_i
+                last_inbreak_time = t_i
+                gap_start = None
+            else:
+                # Continuing break
+                if gap_start is not None:
+                    # We were in a gap, check if it's small enough to bridge
+                    gap_dur = t_i - gap_start
+                    if gap_dur > merge_gap_secs:
+                        # Gap too large, end the break and start new one
+                        break_end = last_inbreak_time
+                        if break_end - break_start >= min_break_secs:
+                            breaks.append((break_start, break_end))
+                        break_start = t_i
+                    gap_start = None
+                last_inbreak_time = t_i
+        else:
+            if in_break:
+                if gap_start is None:
+                    gap_start = t_i
+
+    # Handle break extending to end of scan
+    if in_break:
+        break_end = last_inbreak_time
+        if break_end - break_start >= min_break_secs:
+            breaks.append((break_start, break_end))
+
+    # Merge breaks that are close together (final pass)
+    merged = []
+    for brk_s, brk_e in breaks:
+        if merged and brk_s - merged[-1][1] <= merge_gap_secs:
+            # Merge with previous
+            merged[-1] = (merged[-1][0], brk_e)
+        else:
+            merged.append((brk_s, brk_e))
+
+    # Filter by minimum duration
+    merged = [(s, e) for s, e in merged if e - s >= min_break_secs]
+
+    print(f'  Std-based scan found {len(merged)} break(s)')
+    for i, (brk_s, brk_e) in enumerate(merged):
+        print(f'    Break {i+1}: {fmt(brk_s)}-{fmt(brk_e)}  dur={brk_e-brk_s:.1f}s')
+
+    return merged
 
 
 # ── Segment building ──────────────────────────────────────────────────────────
@@ -164,9 +311,10 @@ def main():
         sys.argv.remove('--dry-run')
         print('[DRY RUN] Detection and segment planning only -- no audio will be encoded.')
 
-    anchor_source  = None
-    anchor_master  = None
-    program_start  = 0.0
+    anchor_source   = None
+    anchor_master   = None
+    program_start   = 0.0
+    breaks_override = None
     for arg in list(sys.argv[1:]):
         if arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
@@ -177,10 +325,15 @@ def main():
         elif arg.startswith('--program-start='):
             program_start = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
+        elif arg.startswith('--breaks='):
+            pairs = arg.split('=', 1)[1].split(',')
+            breaks_override = [tuple(float(x) for x in p.split(':')) for p in pairs]
+            sys.argv.remove(arg)
 
     if anchor_source is None or anchor_master is None or len(sys.argv) != 4:
         sys.exit('Usage: sync_sky_de.py [--dry-run] '
                  '--anchor-source=S --anchor-master=S [--program-start=S] '
+                 '[--breaks=S:E,S:E,...] '
                  '<sky_de_file> <master.mkv> <output_dir>')
 
     sky_de_file, master_file, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -205,61 +358,94 @@ def main():
     ns_stream = f'0:a:{n_audio - 1}'
     print(f'Master audio tracks: {n_audio}  ->  NS on {ns_stream}')
 
-    # ── Build watermark template from anchor time (confirmed live) ──
-    print(f'\nBuilding watermark template at sky_de {fmt(anchor_source)} (race start)...')
-    wm_template = build_watermark_template(
-        sky_de_file, anchor_source, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
-    if wm_template is None:
-        sys.exit('ERROR: Could not build watermark template. Check file and coordinates.')
-    print(f'  Template built from crop={WM_W}x{WM_H}@({WM_X},{WM_Y}) -> {WM_OUT_W}x{WM_OUT_H}')
+    # ── Break override: bypass all detection ──────────────────────────────────
+    if breaks_override is not None:
+        print(f'\n-- Using {len(breaks_override)} pre-specified break(s) --')
+        for i, (s, e) in enumerate(breaks_override):
+            ms, me = s - offset, e - offset
+            print(f'  Break {i+1}: sky_de {fmt(s)}-{fmt(e)}  dur={e-s:.1f}s  '
+                  f'master {fmt(ms)}-{fmt(me)}')
+        print('\nBuilding output segments...')
+        build_and_concat(sky_de_file, master_file, breaks_override, program_start,
+                         offset, d_sky_de, d_master, ns_stream,
+                         output_mka, dry_run=dry_run)
+        print(f'\nDone -> {output_mka}')
+        return
 
-    # ── Scan for ad break starts via watermark ──
+    # ── Std-based scan (primary detector) ────────────────────────────────────
     scan_start = program_start
-    scan_end   = min(d_sky_de, offset + d_master)   # don't scan past master overlap
-    print(f'\nScanning Sky DE for ad breaks via watermark ({fmt(scan_start)} to {fmt(scan_end)})...')
-    print(f'  Watermark params: {WM_W}x{WM_H} at ({WM_X},{WM_Y})  lag={WM_LAG_SECS}s  thresh={WM_THRESH}')
+    scan_end   = min(d_sky_de, offset + d_master)
+    print(f'\nScanning Sky DE for ad breaks via std ({fmt(scan_start)} to {fmt(scan_end)})...')
 
-    wm_breaks = find_all_breaks_via_watermark(
-        sky_de_file, wm_template, WM_X, WM_Y, WM_W, WM_H,
-        WM_OUT_W, WM_OUT_H,
-        scan_start=scan_start, scan_end=scan_end,
-        fps=WM_FPS, thresh=WM_THRESH,
-        min_break_secs=MIN_BREAK_SECS, wm_lag_secs=WM_LAG_SECS)
+    std_raw = find_breaks_via_std(
+        sky_de_file, scan_start, scan_end,
+        WM_X, WM_Y, WM_W, WM_H,
+        fps=STD_SCAN_FPS, min_break_secs=MIN_BREAK_SECS,
+        merge_gap_secs=STD_MERGE_GAP)
+    # Apply watermark lag to std ends
+    std_breaks = [(s, e + WM_LAG_SECS) for s, e in std_raw]
+    print(f'  {len(std_breaks)} candidate break(s) before validation')
 
-    # ── Refine break ends via lead-out sting (primary) ──
+    # ── Validate each candidate via lead-out sting ────────────────────────────
     fp_leadout = str(FP_DIR / 'sky_de_leadout.wav')
     leadout_exists = Path(fp_leadout).exists()
     if leadout_exists:
         sting_needle = load_fp_wav(fp_leadout)
         sting_dur    = len(sting_needle) / SR
-        print(f'\nRefining break ends via lead-out sting ({fp_leadout}, {sting_dur:.2f}s)...')
+        print(f'\nValidating breaks via lead-out sting ({fp_leadout}, {sting_dur:.2f}s)...')
+        print(f'  Accept if: sting conf >= {STING_CONF_THRESH} and std_end within '
+              f'{STING_END_TOLERANCE}s of sting_end')
+        print(f'          OR: no sting and duration >= {STD_CONFIRMED_MIN_SECS}s')
     else:
-        print(f'\nWARNING: Lead-out sting fingerprint not found ({fp_leadout}); '
-              f'using watermark for all break ends.')
+        print(f'\nWARNING: Lead-out sting not found; accepting breaks >= {STD_CONFIRMED_MIN_SECS}s only.')
 
     breaks = []
-    for i, (brk_s, wm_brk_e) in enumerate(wm_breaks):
-        if leadout_exists:
-            search_start = brk_s + MIN_BREAK_SECS
-            search_end   = min(brk_s + MAX_BREAK_SECS, scan_end)
-            search_dur   = search_end - search_start
-            sting_t, sting_conf = find_sting(
-                sky_de_file, fp_leadout, search_start, search_dur,
-                stream_spec='0:a:0',
-                label=f'  Break {i+1} lead-out sting')
-            if sting_conf >= STING_CONF_THRESH:
-                brk_e = sting_t + sting_dur
-                method = f'sting (conf={sting_conf:.4f})'
+    for i, (brk_s, brk_e_std) in enumerate(std_breaks):
+        std_dur = brk_e_std - brk_s
+
+        if not leadout_exists:
+            if std_dur >= STD_CONFIRMED_MIN_SECS:
+                breaks.append((brk_s, brk_e_std))
+                ms, me = brk_s - offset, brk_e_std - offset
+                print(f'  Break {i+1}: ACCEPTED (no sting fp, dur={std_dur:.1f}s) '
+                      f'sky_de {fmt(brk_s)}-{fmt(brk_e_std)}  master {fmt(ms)}-{fmt(me)}')
             else:
-                brk_e  = wm_brk_e
-                method = f'watermark fallback (sting conf={sting_conf:.4f} < {STING_CONF_THRESH})'
+                print(f'  Break {i+1}: rejected  (no sting fp, dur={std_dur:.1f}s < '
+                      f'{STD_CONFIRMED_MIN_SECS}s)')
+            continue
+
+        search_start = brk_s + MIN_BREAK_SECS
+        search_end   = min(brk_s + MAX_BREAK_SECS, scan_end)
+        search_dur   = search_end - search_start
+        sting_t, sting_conf = find_sting(
+            sky_de_file, fp_leadout, search_start, search_dur,
+            stream_spec='0:a:0',
+            label=f'  Break {i+1} sting')
+        sting_end = sting_t + sting_dur
+
+        if sting_conf >= STING_CONF_THRESH:
+            gap = abs(brk_e_std - sting_end)
+            if gap <= STING_END_TOLERANCE:
+                brk_e  = sting_end
+                method = f'sting (conf={sting_conf:.4f})'
+                ms, me = brk_s - offset, brk_e - offset
+                print(f'  Break {i+1}: ACCEPTED ({method}) '
+                      f'sky_de {fmt(brk_s)}-{fmt(brk_e)}  dur={brk_e-brk_s:.1f}s  '
+                      f'master {fmt(ms)}-{fmt(me)}')
+                breaks.append((brk_s, brk_e))
+            else:
+                print(f'  Break {i+1}: rejected  (sting at {fmt(sting_end)} but '
+                      f'std_end={fmt(brk_e_std)}, gap={gap:.0f}s > {STING_END_TOLERANCE}s)')
         else:
-            brk_e  = wm_brk_e
-            method = 'watermark (no sting fingerprint)'
-        breaks.append((brk_s, brk_e))
-        ms, me = brk_s - offset, brk_e - offset
-        print(f'  Break {i+1}: sky_de {fmt(brk_s)}-{fmt(brk_e)}  '
-              f'dur={brk_e-brk_s:.1f}s  master {fmt(ms)}-{fmt(me)}  [{method}]')
+            if std_dur >= STD_CONFIRMED_MIN_SECS:
+                ms, me = brk_s - offset, brk_e_std - offset
+                print(f'  Break {i+1}: ACCEPTED (no sting, dur={std_dur:.1f}s >= '
+                      f'{STD_CONFIRMED_MIN_SECS}s) '
+                      f'sky_de {fmt(brk_s)}-{fmt(brk_e_std)}  master {fmt(ms)}-{fmt(me)}')
+                breaks.append((brk_s, brk_e_std))
+            else:
+                print(f'  Break {i+1}: rejected  (sting conf={sting_conf:.4f} < '
+                      f'{STING_CONF_THRESH}, dur={std_dur:.1f}s < {STD_CONFIRMED_MIN_SECS}s)')
 
     # ── MotoGP 65s pre-race sting extension ──
     fp_sting_gp = str(FP_DIR / 'prerace_sting_motogp.wav')
@@ -275,7 +461,10 @@ def main():
             if last_idx >= 0:
                 brk_s, brk_e = breaks[last_idx]
                 new_end = mgp_t + 65.0
-                if brk_e <= new_end:
+                gap = mgp_t - brk_e
+                if gap > 10.0:
+                    print(f'  Sting at {fmt(mgp_t)} is {gap:.1f}s after break {last_idx+1} end; skipping extension.')
+                elif brk_e <= new_end:
                     breaks[last_idx] = (brk_s, new_end)
                     ms, me = brk_s - offset, new_end - offset
                     print(f'  Extended break {last_idx + 1}: sky_de {fmt(brk_s)}-{fmt(new_end)}  '

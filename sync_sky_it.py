@@ -119,8 +119,8 @@ def find_pubblicita_starts(src, template, scan_start=0.0, scan_end=0.0,
         return []
 
     n_pixels = SKY_PUBB_OUT_W * SKY_PUBB_OUT_H
-    import time
-    tmp = f'/tmp/_tmp_pubb_scan_{int(time.time()*1000)}.raw'
+    import time, tempfile
+    tmp = os.path.join(tempfile.gettempdir(), f'_tmp_pubb_scan_{int(time.time()*1000)}.raw')
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',

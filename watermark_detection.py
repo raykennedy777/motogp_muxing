@@ -100,10 +100,10 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
       Positive (default 4.0): watermark appears AFTER content resumes (break_end is before watermark).
       Negative (e.g. -58.3): watermark appears BEFORE content resumes (break_end is after watermark).
     """
-    import time
+    import time, tempfile
     search_start = break_start + clip_dur
     n_pixels = out_w * out_h
-    tmp = f'/tmp/_tmp_wm_probe_{int(time.time()*1000)}{tmp_suffix}.raw'
+    tmp = os.path.join(tempfile.gettempdir(), f'_tmp_wm_probe_{int(time.time()*1000)}{tmp_suffix}.raw')
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
@@ -171,7 +171,7 @@ def find_break_start_via_watermark(src, sting_time, wm_template,
     search_start = max(0.0, sting_time - search_secs)
     search_dur = sting_time - search_start
     n_pixels = out_w * out_h
-    tmp = f'/tmp/_tmp_wm_break_start_{int(time.time()*1000)}{tmp_suffix}.raw'
+    tmp = os.path.join(tempfile.gettempdir(), f'_tmp_wm_break_start_{int(time.time()*1000)}{tmp_suffix}.raw')
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',

@@ -5,22 +5,26 @@ Add Canal+ French audio to MotoGP race files.
 
 Each race type has a different break structure:
 
-  sprint  -- Canal+Sport 360 Sprint: opening trim + ad breaks
-  moto3   -- Moto3 race: opening trim, optional ad breaks
-  moto2   -- Canal+Sport 360 Moto2: opening trim + ad breaks + silence tail
-  motogp  -- Canal+ UHD Moto GP: opening trim + ad breaks
+  sprint     -- Canal+Sport 360 Sprint: opening trim + ad breaks
+  moto3      -- Moto3 race: opening trim, optional ad breaks
+  moto2      -- Canal+Sport 360 Moto2: opening trim + ad breaks + silence tail
+  motogp     -- Canal+ UHD Moto GP: opening trim + ad breaks
   moto3moto2 -- Combined Moto3+Moto2 file: opening trim + ad breaks
+  sunday     -- Combined Sunday file (Moto3+Moto2+MotoGP): watermark break detection
 
 Break detection methods:
-  --sting  (default): use audio sting correlation + silence detection
+  (default): use audio sting correlation + silence detection
   --watermark: use Canal+ logo watermark absence detection (more robust)
 
 Sync anchor: frame-based (--anchor-source / --anchor-master) or sting-based.
 
 Usage:
-    python sync_canal.py --race {sprint|moto3|moto2|motogp|moto3moto2}
+    python sync_canal.py --race {sprint|moto3|moto2|motogp|moto3moto2|sunday}
                          [--dry-run] [--watermark] [--wm-fps=2]
+                         [--wm-min-break=15] [--wm-min-content=60]
+                         [--wm-scan-end=S] [--breaks=S:E,S:E,...]
                          [--anchor-source=S] [--anchor-master=S]
+                         [--content-end=S] [--opening-dur=S]
                          <canal_file> <master_file> <output_dir>
 
 Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
@@ -358,22 +362,29 @@ def process_canal(canal_file, master_file, output_dir, dry_run,
                 canal_file, search_start, search_dur, CANAL_STREAM,
                 min_silence_sec=MIN_SILENCE_SEC, label='Silence', tmp_suffix='_canal')
 
-            candidates = []
+            # Prefer sting-based lead-ins over silence — silence fires on light
+            # background noise and tends to trigger too early.
+            sting_candidates = []
             if grid_conf >= 0.3:
-                candidates.append(('grid', t_grid))
+                sting_candidates.append(('grid', t_grid))
             if zarco_conf >= 0.3:
-                candidates.append(('zarco', t_zarco))
-            if t_silence is not None:
-                candidates.append(('silence', t_silence))
+                sting_candidates.append(('zarco', t_zarco))
 
-            if candidates:
-                candidates.sort(key=lambda x: x[1])
-                leadin_type, t_in = candidates[0]
+            if sting_candidates:
+                sting_candidates.sort(key=lambda x: x[1])
+                leadin_type, t_in = sting_candidates[0]
+            elif t_silence is not None:
+                leadin_type, t_in = 'silence', t_silence
+            else:
+                leadin_type, t_in = None, None
+
+            if leadin_type is not None:
                 t_end = t_out + sting_dur
                 print(f'  Break: {t_in:.1f}s - {t_end:.1f}s  (lead-in: {leadin_type}, dur={t_end-t_in:.1f}s)')
                 breaks.append((t_in, t_end))
             else:
                 print(f'  No lead-in found - skipping lead-out at {t_out:.1f}s')
+                continue
 
         # Merge overlapping breaks
         breaks.sort(key=lambda x: x[0])
@@ -838,13 +849,95 @@ def moto3moto2_mode(canal_file, master_file, output_dir, dry_run,
     print(f'\nDone -> {output_mka}')
 
 
+def sunday_mode(canal_file, master_file, output_dir, dry_run,
+                anchor_source=None, anchor_master=None,
+                wm_fps=2, wm_min_break=15, wm_min_content=60,
+                wm_scan_end=None,
+                breaks_override=None, content_end_secs=None,
+                opening_dur_secs=None):
+    """
+    Canal+ combined Sunday file (Moto3+Moto2+MotoGP): opening trim + ad breaks.
+    Uses frame-based anchor (--anchor-source / --anchor-master) for sync.
+    Break detection via Canal+ logo watermark absence.
+
+    breaks_override: list of (start_secs, end_secs) tuples, bypasses all detection.
+    content_end_secs: truncate last content window at this time (end-of-program).
+    opening_dur_secs: override OPENING_DUR (default 12s).
+    wm_scan_end: limit watermark scan to this time (seconds).
+    """
+    CANAL_STREAM = '0:a:0'
+    OPENING_DUR  = opening_dur_secs if opening_dur_secs is not None else 12.0
+
+    d_canal  = get_duration(canal_file)
+    d_master = get_duration(master_file)
+    n_audio  = get_audio_stream_count(master_file)
+    ns_stream = f'0:a:{n_audio-1}'
+    print(f'Canal:  {d_canal:.1f}s  ({d_canal/3600:.2f}h)')
+    print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
+
+    # ── Sync anchor (frame-based, required) ──────────────────────────────────
+    if anchor_source is None or anchor_master is None:
+        sys.exit('ERROR: sunday mode requires --anchor-source and --anchor-master')
+    offset = anchor_master - anchor_source
+    print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
+    print(f'  Offset: {offset:.3f}s')
+
+    # ── Break detection ──────────────────────────────────────────────────────
+    if breaks_override is not None:
+        print(f'\n-- Using {len(breaks_override)} pre-specified break(s) --')
+        for i, (s, e) in enumerate(breaks_override):
+            h = int(s//3600); m2 = int((s%3600)//60); sec = s%60
+            print(f'  Break {i+1}: {h:02d}:{m2:02d}:{sec:05.2f} - '
+                  f'{int(e//3600):02d}:{int((e%3600)//60):02d}:{e%60:05.2f}  '
+                  f'dur={e-s:.1f}s')
+        breaks = breaks_override
+        content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
+    else:
+        print('\n-- Watermark break detection --')
+        scan_end_wm = wm_scan_end if wm_scan_end is not None else d_canal
+        breaks = detect_breaks_watermark(
+            canal_file, d_canal, scan_start=OPENING_DUR, scan_end=scan_end_wm,
+            min_break=wm_min_break, wm_fps=wm_fps, min_content=wm_min_content,
+            tmp_suffix='_sundaywm')
+        content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
+
+    # ── Apply content-end truncation ─────────────────────────────────────────
+    if content_end_secs is not None:
+        print(f'\n  Truncating content at {content_end_secs:.1f}s '
+              f'({int(content_end_secs//3600):02d}:{int((content_end_secs%3600)//60):02d}:'
+              f'{content_end_secs%60:05.2f})')
+        content_windows = [(s, min(e, content_end_secs)) for s, e in content_windows]
+        content_windows = [(s, e) for s, e in content_windows if e > s + 1.0]
+
+    print('\nBuilding output segments...')
+    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
+    build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
+                     offset, d_canal, d_master, content_windows,
+                     output_mka, dry_run, tmp_prefix='sunday')
+    print(f'\nDone -> {output_mka}')
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description='Sync Canal+ French audio to a MotoGP master file.')
+    parser.add_argument('--race', choices=['sprint', 'moto3', 'moto2', 'motogp',
+                                           'moto3moto2', 'sunday'],
+                        default=None,
+                        help='Race mode (default: unified sprint/general mode).')
     parser.add_argument('--dry-run', action='store_true',
                         help='Detect and plan only; do not encode.')
+    parser.add_argument('--watermark', action='store_true',
+                        help='Use Canal+ logo watermark for break detection.')
+    parser.add_argument('--wm-fps', type=int, default=2,
+                        help='Watermark scan frame rate (default: 2).')
+    parser.add_argument('--wm-min-break', type=float, default=15.0,
+                        help='Minimum break duration for watermark detection (default: 15s).')
+    parser.add_argument('--wm-min-content', type=float, default=60.0,
+                        help='Minimum content duration for watermark detection (default: 60s).')
+    parser.add_argument('--wm-scan-end', type=float, default=None,
+                        help='Limit watermark scan to this time (seconds).')
     parser.add_argument('--anchor-source', type=float, default=None,
                         help='Frame-based anchor time in source file (seconds).')
     parser.add_argument('--anchor-master', type=float, default=None,
@@ -853,6 +946,9 @@ def main():
                         help='Truncate content at this time (seconds).')
     parser.add_argument('--opening-dur', type=float, default=None,
                         help='Override program start time (seconds).')
+    parser.add_argument('--breaks', type=str, default=None,
+                        help='Override breaks as comma-separated start:end pairs in seconds '
+                             '(e.g. 100:200,300:400).')
     parser.add_argument('canal_file')
     parser.add_argument('master_file')
     parser.add_argument('output_dir')
@@ -861,21 +957,69 @@ def main():
     if args.dry_run:
         print('[DRY RUN] Detection and planning only - no audio will be encoded.')
 
-    needed = [
-        'canal_grid_ending.wav', 'preshow_intro_m2m3.wav',
-        'canal_opening.wav', 'canal_zarco_ad.wav',
-        'prerace_sting_motogp.wav',
-    ]
-    for fp in needed:
-        p = FP_DIR / fp
-        if not p.exists():
-            sys.exit(f'ERROR: Missing fingerprint: {p}')
+    breaks_override = None
+    if args.breaks:
+        try:
+            pairs = [p.split(':') for p in args.breaks.split(',')]
+            breaks_override = [(float(s), float(e)) for s, e in pairs]
+        except Exception:
+            sys.exit('ERROR: --breaks must be comma-separated start:end pairs '
+                     '(e.g. 100:200,300:400)')
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    process_canal(args.canal_file, args.master_file, args.output_dir, args.dry_run,
-                  anchor_source=args.anchor_source, anchor_master=args.anchor_master,
-                  content_end_secs=args.content_end, opening_dur_secs=args.opening_dur)
+    race = args.race
+
+    if race is None or race == 'sprint':
+        needed = [
+            'canal_grid_ending.wav', 'preshow_intro_m2m3.wav',
+            'canal_opening.wav', 'canal_zarco_ad.wav',
+            'prerace_sting_motogp.wav',
+        ]
+        for fp in needed:
+            p = FP_DIR / fp
+            if not p.exists():
+                sys.exit(f'ERROR: Missing fingerprint: {p}')
+        process_canal(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                      anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                      content_end_secs=args.content_end, opening_dur_secs=args.opening_dur)
+
+    elif race == 'moto3':
+        moto3_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                   anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                   use_watermark=args.watermark, wm_fps=args.wm_fps,
+                   wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
+                   opening_dur_secs=args.opening_dur)
+
+    elif race == 'moto2':
+        moto2_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                   anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                   use_watermark=args.watermark, wm_fps=args.wm_fps,
+                   wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content)
+
+    elif race == 'motogp':
+        motogp_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                    anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                    use_watermark=args.watermark, wm_fps=args.wm_fps,
+                    wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
+                    content_end_secs=args.content_end)
+
+    elif race == 'moto3moto2':
+        moto3moto2_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                        anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                        use_watermark=args.watermark, wm_fps=args.wm_fps,
+                        wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
+                        wm_scan_end=args.wm_scan_end,
+                        breaks_override=breaks_override, content_end_secs=args.content_end,
+                        opening_dur_secs=args.opening_dur)
+
+    elif race == 'sunday':
+        sunday_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
+                    anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                    wm_fps=args.wm_fps, wm_min_break=args.wm_min_break,
+                    wm_min_content=args.wm_min_content, wm_scan_end=args.wm_scan_end,
+                    breaks_override=breaks_override, content_end_secs=args.content_end,
+                    opening_dur_secs=args.opening_dur)
 
 
 if __name__ == '__main__':

@@ -149,78 +149,276 @@ def find_breaks_via_watermark_fast(src, wm_template, wm_x, wm_y, wm_w, wm_h,
 
 # ── Watermark-based break detection ──────────────────────────────────────
 
-def detect_watermark_ref_time(src, search_start=300, search_dur=600,
-                              stream_spec='v:0', tmp_suffix=''):
+def find_breaks_via_green_chroma(src, wm_x, wm_y, wm_w, wm_h,
+                                  scan_start, scan_end,
+                                  fps=1, min_break_secs=30,
+                                  green_thresh=150, green_ratio=1.8,
+                                  tmp_suffix=''):
     """
-    Find a suitable watermark reference time in the video.
-    Default: frame 91586 (1831.72s) confirmed as having both logos visible.
+    Detect PIP ad breaks by chroma-key green in the watermark region.
+
+    During RTBF PIP breaks the top-right corner is filled with pure broadcast
+    chroma-key green (approx RGB 0,240,90).  This is far more reliable than
+    template correlation because it is independent of the scene background.
+
+    Criteria: mean_G > green_thresh  AND  mean_G > green_ratio * mean_R
+                                     AND  mean_G > green_ratio * mean_B
+
+    Returns list of (break_start, break_end) tuples.
+    """
+    scan_dur = max(0.0, scan_end - scan_start)
+    if scan_dur <= 0:
+        return []
+
+    tmp = f'_tmp_wm_green{tmp_suffix}.raw'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+             '-ss', f'{scan_start:.3f}', '-t', f'{scan_dur:.0f}',
+             '-i', str(src),
+             '-vf', (f'fps={fps},'
+                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y}'),
+             '-f', 'rawvideo', '-pix_fmt', 'rgb24', tmp],
+            check=True)
+        raw = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
+        os.remove(tmp)
+    except Exception as e:
+        print(f'  WARNING: Green chroma scan failed: {e}')
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return []
+
+    n_pixels = wm_w * wm_h
+    n_frames = len(raw) // (n_pixels * 3)
+    if n_frames == 0:
+        return []
+
+    frames = raw.reshape(n_frames, n_pixels, 3)   # R, G, B
+    means  = frames.mean(axis=1)                   # (n_frames, 3)
+    r, g, b = means[:, 0], means[:, 1], means[:, 2]
+
+    is_green = (g > green_thresh) & (g > green_ratio * r) & (g > green_ratio * b)
+
+    step = 1.0 / fps
+    min_frames = max(1, int(min_break_secs * fps))
+    breaks = []
+    in_break = False
+    break_start = None
+
+    for i in range(n_frames):
+        t = scan_start + i * step
+        if not in_break:
+            if is_green[i]:
+                in_break = True
+                break_start = t
+        else:
+            if not is_green[i]:
+                dur_frames = int((t - break_start) * fps)
+                if dur_frames >= min_frames:
+                    breaks.append((break_start, t))
+                    print(f'    PIP green break: {fmt(break_start)} - {fmt(t)}  '
+                          f'dur={fmt(t - break_start)}')
+                in_break = False
+
+    if in_break:
+        t_end = scan_end
+        dur_frames = int((t_end - break_start) * fps)
+        if dur_frames >= min_frames:
+            breaks.append((break_start, t_end))
+            print(f'    PIP green break (to end): {fmt(break_start)} - {fmt(t_end)}  '
+                  f'dur={fmt(t_end - break_start)}')
+
+    return breaks
+
+
+def _find_logo_present_ref_time(src, wm_x, wm_y, wm_w, wm_h,
+                                 scan_start=60, scan_end=1200,
+                                 fps=0.2, tmp_suffix=''):
+    """
+    Auto-detect a reference time where the TIPIK logo is likely visible.
+
+    The logo appears as white/orange text on a dark background.  We look for
+    a frame where the watermark region is dark (mean brightness 30–130) and
+    not green-dominant.  Scanning at 0.2fps to keep it fast.
+
+    Returns the best candidate time, or None if not found.
+    """
+    scan_dur = max(0.0, scan_end - scan_start)
+    if scan_dur <= 0:
+        return None
+
+    tmp = f'_tmp_wm_ref{tmp_suffix}.raw'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+             '-ss', f'{scan_start:.1f}', '-t', f'{scan_dur:.0f}',
+             '-i', str(src),
+             '-vf', (f'fps={fps},'
+                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y}'),
+             '-f', 'rawvideo', '-pix_fmt', 'rgb24', tmp],
+            check=True)
+        raw = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
+        os.remove(tmp)
+    except Exception as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return None
+
+    n_pixels = wm_w * wm_h
+    n_frames = len(raw) // (n_pixels * 3)
+    if n_frames == 0:
+        return None
+
+    frames = raw.reshape(n_frames, n_pixels, 3)
+    means  = frames.mean(axis=1)
+    brightness = means.mean(axis=1)   # mean of R,G,B per frame
+    r, g, b = means[:, 0], means[:, 1], means[:, 2]
+    is_green = (g > 150) & (g > 1.8 * r) & (g > 1.8 * b)
+    is_bright = brightness > 170     # sky/scene without logo — avoid these
+
+    step = 1.0 / fps
+    best_t = None
+    best_score = None  # prefer darkest non-green, non-bright frame
+
+    for i in range(n_frames):
+        if is_green[i] or is_bright[i]:
+            continue
+        if brightness[i] < 30:
+            continue  # too dark (black frame or fade)
+        score = brightness[i]
+        if best_score is None or score < best_score:
+            best_score = score
+            best_t = scan_start + i * step
+
+    return best_t
+
+
+def detect_watermark_ref_time(src, scan_start=60, scan_end=None,
+                               wm_ref_time_override=None, tmp_suffix=''):
+    """
+    Find a suitable reference time where the TIPIK logo is visible.
+
+    Scans the first portion of the file looking for a dark, non-green frame
+    in the watermark region (logo on dark background).  Falls back to the
+    hardcoded default only if auto-detection fails.
+
     Returns time in seconds.
     """
     d = get_duration(src)
-    ref_time = DEFAULT_WM_REF_TIME
-    if ref_time > d - 60:
-        ref_time = min(search_start + 180, d - 60)
-    print(f'  Watermark reference time: {ref_time:.1f}s (frame {int(ref_time * RTBF_FPS)})')
+    if scan_end is None:
+        scan_end = min(d - 60, 3600)
+
+    if wm_ref_time_override is not None:
+        print(f'  Watermark reference time: {wm_ref_time_override:.1f}s (manual override)')
+        return wm_ref_time_override
+
+    ref_time = _find_logo_present_ref_time(
+        src, RTBF_WM_X, RTBF_WM_Y, RTBF_WM_W, RTBF_WM_H,
+        scan_start=scan_start, scan_end=scan_end,
+        fps=0.2, tmp_suffix=tmp_suffix)
+
+    if ref_time is None:
+        # Fallback: use default if it fits in the file, else near start
+        ref_time = DEFAULT_WM_REF_TIME if DEFAULT_WM_REF_TIME < d - 60 else max(scan_start, 120)
+        print(f'  Watermark reference time: {ref_time:.1f}s (fallback default)')
+    else:
+        print(f'  Watermark reference time: {ref_time:.1f}s (auto-detected logo-present frame)')
+
     return ref_time
 
 
 def detect_rtbf_watermark_breaks(src, d_src, scan_start=0, scan_end=None,
-                                  wm_ref_time=None, wm_fps=2,
-                                  min_break=15, tmp_suffix=''):
+                                  wm_ref_time=None, wm_fps=1,
+                                  min_break=30, tmp_suffix=''):
     """
-    Detect ad breaks via RTBF TIPIK watermark absence.
-    Falls back to MGP logo if TIPIK template fails.
-    Returns list of (break_start, break_end) tuples.
+    Detect ad breaks via two complementary methods:
+
+    1. PIP green chroma-key detection (reliable for PIP breaks):
+       Checks if the TIPIK watermark region is filled with broadcast
+       chroma-key green (approx RGB 0,240,90).
+
+    2. Template correlation for full-screen breaks:
+       Uses Pearson correlation against a reference frame where the TIPIK
+       logo is confirmed present (auto-detected dark, non-green frame).
+       Requires min_break >= 90s to suppress false positives from momentary
+       logo absences during race graphics or bright sky shots.
+
+    Returns merged, sorted list of (break_start, break_end) tuples.
     """
     if scan_end is None:
         scan_end = d_src - 10.0
 
-    if wm_ref_time is None:
-        wm_ref_time = detect_watermark_ref_time(src, tmp_suffix=tmp_suffix)
+    # ── Method 1: PIP green chroma-key ──────────────────────────────────────
+    print('\n  Scanning for PIP breaks (green chroma-key)...')
+    print(f'  Region: crop={RTBF_WM_W}x{RTBF_WM_H}@({RTBF_WM_X},{RTBF_WM_Y})  '
+          f'FPS: {wm_fps}  min_break: {min_break}s')
+    pip_breaks = find_breaks_via_green_chroma(
+        src, RTBF_WM_X, RTBF_WM_Y, RTBF_WM_W, RTBF_WM_H,
+        scan_start=scan_start, scan_end=scan_end,
+        fps=wm_fps, min_break_secs=min_break,
+        tmp_suffix=tmp_suffix)
+    if not pip_breaks:
+        print('  No PIP breaks found.')
+    else:
+        print(f'  {len(pip_breaks)} PIP break(s) found.')
 
-    # Build watermark template from RTBF TIPIK logo
-    print(f'\n  Building RTBF TIPIK watermark template at {wm_ref_time:.1f}s...')
+    # ── Method 2: Template correlation (full-screen breaks) ──────────────────
+    # Use a minimum of 90s for template correlation to suppress short FPs from
+    # sky shots, race graphics, and post-race scenes where logo briefly absent.
+    tmpl_min_break = max(90, min_break)
+
+    ref_time = detect_watermark_ref_time(
+        src, wm_ref_time_override=wm_ref_time, tmp_suffix=tmp_suffix)
+
+    print(f'\n  Building RTBF TIPIK watermark template at {ref_time:.1f}s...')
     rtbf_template = build_watermark_template(
-        src, wm_ref_time, RTBF_WM_X, RTBF_WM_Y, RTBF_WM_W, RTBF_WM_H,
+        src, ref_time, RTBF_WM_X, RTBF_WM_Y, RTBF_WM_W, RTBF_WM_H,
         out_w=32, out_h=32, tmp_suffix=f'{tmp_suffix}_rtbf')
 
-    # Also build MGP logo template as fallback
-    print(f'  Building MGP logo watermark template at {wm_ref_time:.1f}s...')
-    mgp_template = build_watermark_template(
-        src, wm_ref_time, MGP_WM_X, MGP_WM_Y, MGP_WM_W, MGP_WM_H,
-        out_w=32, out_h=32, tmp_suffix=f'{tmp_suffix}_mgp')
-
-    if rtbf_template is None and mgp_template is None:
-        print('  WARNING: Could not build any watermark template')
-        return []
-
-    # Prefer RTBF template, fall back to MGP
-    template = rtbf_template if rtbf_template is not None else mgp_template
-    wm_x = RTBF_WM_X if rtbf_template is not None else MGP_WM_X
-    wm_y = RTBF_WM_Y if rtbf_template is not None else MGP_WM_Y
-    wm_w = RTBF_WM_W if rtbf_template is not None else MGP_WM_W
-    wm_h = RTBF_WM_H if rtbf_template is not None else MGP_WM_H
-    wm_name = "RTBF TIPIK" if rtbf_template is not None else "MGP logo"
-
-    print(f'\n  Scanning for breaks via {wm_name} watermark (optimized)...')
-    print(f'  Scan: {scan_start:.1f}s - {scan_end:.1f}s  FPS: {wm_fps}')
-
-    breaks = find_breaks_via_watermark_fast(
-        src, template,
-        wm_x, wm_y, wm_w, wm_h,
-        32, 32,
-        scan_start=scan_start, scan_end=scan_end,
-        fps=wm_fps, thresh=0.44, min_break_secs=min_break,
-        tmp_suffix=f'{tmp_suffix}_scan')
-
-    if not breaks:
-        print(f'  WARNING: No breaks detected via {wm_name} watermark')
+    fs_breaks = []
+    if rtbf_template is not None:
+        print(f'\n  Scanning for full-screen breaks (template correlation, min={tmpl_min_break}s)...')
+        print(f'  Scan: {scan_start:.1f}s - {scan_end:.1f}s  FPS: {wm_fps}')
+        fs_breaks = find_breaks_via_watermark_fast(
+            src, rtbf_template,
+            RTBF_WM_X, RTBF_WM_Y, RTBF_WM_W, RTBF_WM_H,
+            32, 32,
+            scan_start=scan_start, scan_end=scan_end,
+            fps=wm_fps, thresh=0.44, min_break_secs=tmpl_min_break,
+            tmp_suffix=f'{tmp_suffix}_scan')
+        if not fs_breaks:
+            print('  No full-screen breaks found.')
+        else:
+            print(f'  {len(fs_breaks)} full-screen break(s) found.')
     else:
-        print(f'\n  {len(breaks)} break(s) detected via {wm_name} watermark:')
-        for i, (s, e) in enumerate(breaks):
+        print('  WARNING: Could not build TIPIK template — skipping full-screen detection')
+
+    # ── Merge and deduplicate ─────────────────────────────────────────────────
+    all_breaks = sorted(pip_breaks + fs_breaks, key=lambda x: x[0])
+
+    # Remove any full-screen break that overlaps an already-found PIP break
+    merged = []
+    for s, e in all_breaks:
+        if merged and s < merged[-1][1] + 5:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    if not merged:
+        print('  WARNING: No breaks detected')
+    else:
+        print(f'\n  {len(merged)} break(s) detected (PIP: {len(pip_breaks)}, '
+              f'full-screen: {len(fs_breaks)}):')
+        for i, (s, e) in enumerate(merged):
             print(f'    Break {i+1}: {fmt(s)} - {fmt(e)}  dur={fmt(e-s)}')
 
-    return breaks
+    return merged
 
 
 # ── Sting-based break detection ──────────────────────────────────────────
@@ -239,7 +437,7 @@ def detect_rtbf_sting_breaks(src, d_src, search_start=0, tmp_suffix=''):
         print(f'    Lead-out: {fp_leadout}')
         return []
 
-    print('\n── Sting-based break detection ──')
+    print('\n-- Sting-based break detection --')
     print(f'  Scanning from {search_start:.1f}s to end of file...')
 
     # Find all lead-in stings (ad break starts)
@@ -496,7 +694,7 @@ def main():
         sys.exit('ERROR: Either --race or --anchor-source/--anchor-master must be specified.')
 
     # ── Break detection ──
-    print('\n── Ad break detection ──')
+    print('\n-- Ad break detection --')
     if args.sting_only:
         breaks = detect_rtbf_sting_breaks(args.rtbf_file, d_src, tmp_suffix='_main')
     else:

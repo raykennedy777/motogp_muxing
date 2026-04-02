@@ -22,8 +22,8 @@ def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
     Returns (absolute_time_sec, confidence).
     Includes a duration guard so the search window never exceeds the file length.
     """
-    import time
-    tmp = f'/tmp/_tmp_sting_{int(time.time()*1000)}{tmp_suffix}.wav'
+    import time, tempfile
+    tmp = os.path.join(tempfile.gettempdir(), f'_tmp_sting_{int(time.time()*1000)}{tmp_suffix}.wav')
     actual_dur = min(search_dur, get_duration(src) - search_start)
     if actual_dur <= 0:
         return search_start, 0.0

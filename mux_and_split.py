@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 mux_and_split.py
-Mux polsat_master + 5 audio tracks into combined_master.mkv, then split
-into 3 race MKVs (Moto3 / Moto2 / MotoGP) whose durations match the
+Mux polsat_master video with all synced audio tracks into combined_master.mkv,
+then split into 3 race MKVs (Moto3 / Moto2 / MotoGP) whose durations match the
 WEB-DL references frame-accurately.
 
 Phase 1 — detect split points via pre-race sting fingerprints
-Phase 2 — mkvmerge: polsat video + WF/TNT/DAZN/Polsat/NS audio
+Phase 2 — mkvmerge: polsat video + combined audio tracks
 Phase 3 — frame-accurate split (smart-cut: re-encode partial GOP only)
+Phase 4 — per-race remux inserting individual tracks + priority reordering
 
 Usage:
     python mux_and_split.py --round N --session Race|Sprint
@@ -44,6 +45,14 @@ VIDEO_MATCH_W       = 128    # downsample width for comparison
 VIDEO_MATCH_H       = 72     # downsample height
 VIDEO_SEARCH_MARGIN = 2.0    # ±seconds to search around audio estimate
 VIDEO_MIN_QUALITY   = 0.3    # minimum normalised-SSD quality to accept
+
+# Audio track priority order (see CLAUDE.md). Matched against track names
+# set by mux_combined / remux_with_individual_tracks.
+TRACK_PRIORITY = [
+    'World Feed', 'TNT Sports', 'DAZN', 'Sky Sport MotoGP', 'RSI',
+    'Canal+', 'RTBF', 'RTS', 'Sky Sport', 'ServusTV', 'SRF',
+    'Sport TV', 'Ziggo', 'Polsat Sport', 'evgenymotogp', 'Natural Sounds',
+]
 
 CALENDARS = {
     2026: {
@@ -287,10 +296,14 @@ def detect_split_points(web_master, polsat_master, moto2_webdl, motogp_webdl):
 
 # ── Phase 2: Mux with mkvmerge ────────────────────────────────────────────────
 
-def mux_combined(polsat_master, web_master, tnt_mka, dazn_mka, output):
+def mux_combined(polsat_master, web_master, combined_tracks, output):
     """
-    Combine polsat_master video with 5 audio tracks into combined_master.mkv.
-    Track order: video | World Feed | TNT Sports | DAZN | Polsat Sport | Natural Sounds
+    Combine polsat_master video with arbitrary audio tracks into combined_master.mkv.
+
+    combined_tracks: list of (path, track_name, language) tuples for synced MKA files.
+    These tracks are inserted between World Feed and Polsat/Natural Sounds.
+
+    Track order: video | World Feed | [combined_tracks...] | Polsat | Natural Sounds
     Returns (codec_str, resolution_str) detected from polsat_master.
     """
     pol_vids, pol_audios = identify_tracks(polsat_master)
@@ -323,6 +336,8 @@ def mux_combined(polsat_master, web_master, tnt_mka, dazn_mka, output):
     print(f'\nMuxing -> {output.name}')
     print(f'  polsat video track {vid_id}  ({codec} {resolution})')
     print(f'  web_master: WF={wf_id}  NS={ns_id}   polsat audio: Polsat={pol_id}')
+    for path, name, lang in combined_tracks:
+        print(f'  {path.name}: {name} ({lang})')
 
     mkv = ['mkvmerge', '--output', str(output)]
 
@@ -337,40 +352,39 @@ def mux_combined(polsat_master, web_master, tnt_mka, dazn_mka, output):
             '--default-track', f'{wf_id}:yes',
             str(web_master)]
 
-    # Input 2 – tnt_mka: TNT Sports (eng)
-    mkv += ['--no-video', '--no-subtitles', '--no-chapters',
-            '--audio-tracks',  '0',
-            '--track-name',    '0:TNT Sports',
-            '--language',      '0:eng',
-            '--default-track', '0:no',
-            str(tnt_mka)]
+    # Inputs 2..N – combined synced audio tracks
+    track_order_parts = [f'0:{vid_id}', f'1:{wf_id}']
+    for i, (path, name, lang) in enumerate(combined_tracks):
+        inp = 2 + i
+        mkv += ['--no-video', '--no-subtitles', '--no-chapters',
+                '--audio-tracks',  '0',
+                '--track-name',    f'0:{name}',
+                '--language',      f'0:{lang}',
+                '--default-track', '0:no',
+                str(path)]
+        track_order_parts.append(f'{inp}:0')
 
-    # Input 3 – dazn_mka: DAZN (spa)
-    mkv += ['--no-video', '--no-subtitles', '--no-chapters',
-            '--audio-tracks',  '0',
-            '--track-name',    '0:DAZN',
-            '--language',      '0:spa',
-            '--default-track', '0:no',
-            str(dazn_mka)]
-
-    # Input 4 – polsat_master: Polsat Sport audio (pol) — same file, 2nd occurrence
+    # Input after combined – polsat_master: Polsat Sport audio (pol)
+    polsat_audio_inp = 2 + len(combined_tracks)
     mkv += ['--no-video', '--no-subtitles', '--no-chapters',
             '--audio-tracks',  str(pol_id),
             '--track-name',    f'{pol_id}:Polsat Sport',
             '--language',      f'{pol_id}:pol',
             '--default-track', f'{pol_id}:no',
             str(polsat_master)]
+    track_order_parts.append(f'{polsat_audio_inp}:{pol_id}')
 
-    # Input 5 – web_master: Natural Sounds (und) — same file, 2nd occurrence
+    # Final input – web_master: Natural Sounds (und)
+    ns_inp = polsat_audio_inp + 1
     mkv += ['--no-video', '--no-subtitles', '--no-chapters',
             '--audio-tracks',  str(ns_id),
             '--track-name',    f'{ns_id}:Natural Sounds',
             '--language',      f'{ns_id}:und',
             '--default-track', f'{ns_id}:no',
             str(web_master)]
+    track_order_parts.append(f'{ns_inp}:{ns_id}')
 
-    mkv += ['--track-order',
-            f'0:{vid_id},1:{wf_id},2:0,3:0,4:{pol_id},5:{ns_id}']
+    mkv += ['--track-order', ','.join(track_order_parts)]
 
     subprocess.run(mkv, check=True)
     return codec, resolution
@@ -452,6 +466,68 @@ def smart_cut(src, output, t_start, webdl_dur, codec_str, exclude_audio=None):
         check=True)
 
 
+# ── Phase 4: Remux split intermediate with individual tracks ──────────────────
+
+def remux_with_individual_tracks(split_file, output, individual_tracks):
+    """
+    Remux a split intermediate file, inserting individual audio tracks
+    and reordering all audio by TRACK_PRIORITY.
+
+    split_file: intermediate MKV from smart_cut (video + combined audio tracks)
+    output: final output path
+    individual_tracks: list of (path, track_name, language) tuples
+    """
+    vid_tracks, aud_tracks = identify_tracks(split_file)
+    if not vid_tracks:
+        sys.exit(f'ERROR: No video track in {split_file}')
+
+    vid_id = vid_tracks[0]['id']
+
+    # Sort key: position in TRACK_PRIORITY, fallback 99
+    def _sort_key(name):
+        for i, key in enumerate(TRACK_PRIORITY):
+            if key in name:
+                return i
+        return 99
+
+    # Build unified list: (is_new, path, name, lang_or_none, split_track_info)
+    all_audio = []
+    for t in aud_tracks:
+        name = t.get('properties', {}).get('track_name', '')
+        all_audio.append(('split', None, name, None, t))
+    for path, name, lang in individual_tracks:
+        all_audio.append(('new', path, name, lang, None))
+
+    # Sort everything together by TRACK_PRIORITY
+    all_audio.sort(key=lambda x: _sort_key(x[2]))
+
+    mkv = ['mkvmerge', '--output', str(output)]
+
+    # Input 0 – split file: video + all combined audio tracks
+    mkv += ['--no-subtitles', '--no-chapters', str(split_file)]
+
+    track_order_parts = [f'0:{vid_id}']
+    new_input_idx = 1
+    for kind, path, name, lang, t_info in all_audio:
+        if kind == 'split':
+            track_order_parts.append(f'0:{t_info["id"]}')
+        else:
+            mkv += ['--no-video', '--no-subtitles', '--no-chapters',
+                    '--audio-tracks',  '0',
+                    '--track-name',    f'0:{name}',
+                    '--language',      f'0:{lang}',
+                    '--default-track', '0:no',
+                    str(path)]
+            track_order_parts.append(f'{new_input_idx}:0')
+            new_input_idx += 1
+
+    mkv += ['--track-order', ','.join(track_order_parts)]
+
+    n_new = sum(1 for k, *_ in all_audio if k == 'new')
+    print(f'  Remuxing with {n_new} individual tracks -> {output.name}')
+    subprocess.run(mkv, check=True)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -470,8 +546,12 @@ def main():
                     help='Keep combined_master.mkv after splitting')
     ap.add_argument('--combined-master', metavar='FILE',
                     help='Use existing combined MKV; skip the mux phase')
-    ap.add_argument('--year',            type=int, default=2025,
-                    help='Broadcast year for output filenames (default: 2025)')
+    ap.add_argument('--combined-audio-dir', metavar='DIR',
+                    help='Directory with combined synced MKA files (default: wip-dir/combined_audio)')
+    ap.add_argument('--individual-audio-dir', metavar='DIR',
+                    help='Directory with per-race synced MKA files (default: wip-dir/individual_audio)')
+    ap.add_argument('--year',            type=int, default=2026,
+                    help='Broadcast year for output filenames (default: 2026)')
     ap.add_argument('--dry-run',         action='store_true',
                     help='Detect split points and print plan; no files written')
     ap.add_argument('--mux-only',        action='store_true',
@@ -492,26 +572,30 @@ def main():
     web_master    = find_file(wip_dir,
                               '*web*master*.mkv', '*web*master*.mp4',
                               '*web*.mkv')
-    tnt_mka       = find_file(wip_dir,
-                              'tnt_*_synced.mka', '*tnt*synced*.mka',
-                              '*tnt*.mka')
-    dazn_mka      = find_file(wip_dir,
-                              'dazn_*_synced.mka', '*dazn*synced*.mka',
-                              '*dazn*.mka')
+
+    # ── Auto-detect combined audio tracks ──
+    combined_audio_dir = Path(args.combined_audio_dir) if args.combined_audio_dir else wip_dir / 'combined_audio'
+    combined_tracks = _detect_combined_tracks(combined_audio_dir) if combined_audio_dir.exists() else []
+
+    # ── Auto-detect individual audio tracks ──
+    individual_audio_dir = Path(args.individual_audio_dir) if args.individual_audio_dir else wip_dir / 'individual_audio'
+    individual_tracks_by_race = _detect_individual_tracks(individual_audio_dir) if individual_audio_dir.exists() else {}
 
     # ── --mux-only: skip detection and splitting, just produce combined_master.mkv ──
     if args.mux_only:
-        for label, f in (('polsat_master', polsat_master), ('web_master', web_master),
-                         ('tnt_mka', tnt_mka), ('dazn_mka', dazn_mka)):
-            if not f:
-                sys.exit(f'ERROR: Cannot find {label} in {wip_dir}')
+        if not polsat_master:
+            sys.exit(f'ERROR: Cannot find polsat_master in {wip_dir}')
+        if not web_master:
+            sys.exit(f'ERROR: Cannot find web_master in {wip_dir}')
+        if not combined_tracks:
+            sys.exit(f'ERROR: No combined audio tracks found in {combined_audio_dir}')
         print(f'  polsat_master : {polsat_master.name}')
         print(f'  web_master    : {web_master.name}')
-        print(f'  tnt_mka       : {tnt_mka.name}')
-        print(f'  dazn_mka      : {dazn_mka.name}')
+        for path, name, lang in combined_tracks:
+            print(f'  combined: {path.name} -> {name} ({lang})')
         out_dir.mkdir(parents=True, exist_ok=True)
         combined = out_dir / 'combined_master.mkv'
-        mux_combined(polsat_master, web_master, tnt_mka, dazn_mka, combined)
+        mux_combined(polsat_master, web_master, combined_tracks, combined)
         print(f'\nDone -> {combined}')
         return
 
@@ -535,16 +619,19 @@ def main():
             sys.exit(f'ERROR: Missing fingerprint: {fp}')
 
     skip_mux = args.combined_master is not None
-    for label, f in (('polsat_master', polsat_master), ('web_master', web_master),
-                     ('tnt_mka',       tnt_mka),       ('dazn_mka',   dazn_mka)):
-        if not f and not (skip_mux and label in ('tnt_mka', 'dazn_mka')):
-            sys.exit(f'ERROR: Cannot find {label} in {wip_dir}')
+    if not polsat_master:
+        sys.exit(f'ERROR: Cannot find polsat_master in {wip_dir}')
+    if not web_master:
+        sys.exit(f'ERROR: Cannot find web_master in {wip_dir}')
+    if not skip_mux and not combined_tracks:
+        sys.exit(f'ERROR: No combined audio tracks found in {combined_audio_dir}')
 
     print(f'Round {round_str} {country} — {session}')
     print(f'  polsat_master : {polsat_master.name}')
     print(f'  web_master    : {web_master.name}')
-    print(f'  tnt_mka       : {tnt_mka.name if tnt_mka else "N/A (--combined-master mode)"}')
-    print(f'  dazn_mka      : {dazn_mka.name if dazn_mka else "N/A (--combined-master mode)"}')
+    print(f'  combined tracks: {len(combined_tracks)}')
+    for path, name, lang in combined_tracks:
+        print(f'    {path.name} -> {name} ({lang})')
 
     # ── Auto-detect WEB-DL files ──
     moto3_webdl = moto2_webdl = motogp_webdl = None
@@ -597,28 +684,43 @@ def main():
     else:
         combined = out_dir / 'combined_master.mkv'
         codec, resolution = mux_combined(
-            polsat_master, web_master, tnt_mka, dazn_mka, combined)
+            polsat_master, web_master, combined_tracks, combined)
+
+    # Total audio track count from split intermediate: WF + combined_tracks + Polsat + NS
+    n_combined_audio = len(combined_tracks) + 3  # +3 for World Feed + Polsat + Natural Sounds
 
     # ── Phase 3: Split ──
-    def output_name(cls):
-        return out_dir / (
-            f'{cls}.{args.year}.Round{round_str}.{country}.{session}.'
-            f'Polsat.HDTV.{resolution}.{codec}.Multi5.mkv'
-        )
-
     exclude_audio = args.exclude_audio or []
     if exclude_audio:
         print(f'\nExcluding audio tracks {exclude_audio} from split output files.')
 
+    intermediates = []
     for cls, t_start, dur, frames in (
         ('Moto3',  0.0,          moto3_dur,  moto3_frames),
         ('Moto2',  moto2_start,  moto2_dur,  moto2_frames),
         ('MotoGP', motogp_start, motogp_dur, motogp_frames),
     ):
-        out_file = output_name(cls)
+        # Intermediate file for smart_cut
+        intermediate = out_dir / f'_intermediate_{cls}.mkv'
         print(f'\n-- {cls}: t={t_start:.3f}s  {frames} frames')
+        print(f'   -> splitting to intermediate: {intermediate.name}')
+        smart_cut(combined, intermediate, t_start, dur, codec, exclude_audio)
+        intermediates.append((cls, intermediate, frames))
+
+    # ── Phase 4: Remux with individual tracks ──
+    for cls, intermediate, frames in intermediates:
+        race_individual = individual_tracks_by_race.get(cls, [])
+        n_total_audio = n_combined_audio + len(race_individual)
+
+        out_file = out_dir / (
+            f'{cls}.{args.year}.Round{round_str}.{country}.{session}.'
+            f'Polsat.HDTV.{resolution}.{codec}.Multi{n_total_audio}.mkv'
+        )
+
+        print(f'\n-- {cls}: remux with {len(race_individual)} individual tracks')
         print(f'   -> {out_file.name}')
-        smart_cut(combined, out_file, t_start, dur, codec, exclude_audio)
+        remux_with_individual_tracks(intermediate, out_file, race_individual)
+        intermediate.unlink()  # clean up intermediate
 
     # Optionally delete combined master (never delete a user-provided file)
     if not skip_mux and not args.keep_combined and combined.exists():
@@ -627,6 +729,94 @@ def main():
         combined.unlink()
 
     print('\nDone.')
+
+
+# ── Audio track auto-detection helpers ────────────────────────────────────────
+
+def _detect_combined_tracks(directory):
+    """
+    Scan directory for synced MKA files that span all 3 races.
+    Returns list of (path, track_name, language) tuples in priority order.
+    """
+    # Priority-ordered patterns: (glob_patterns, track_name, language)
+    patterns = [
+        (['*dazn*synced*.mka', '*Races*synced*.mka'], 'DAZN', 'spa'),
+        (['*sky_it*synced*.mka', '*sky_sport_it*synced*.mka'], 'Sky Sport MotoGP', 'ita'),
+        (['*rsi*synced*.mka'], 'RSI', 'ita'),
+        (['*canal*synced*.mka', '*canalplus*synced*.mka'], 'Canal+', 'fra'),
+        (['*rtbf*synced*.mka'], 'RTBF', 'fra'),
+        (['*sky_de*synced*.mka', '*sky_sport_de*synced*.mka'], 'Sky Sport', 'deu'),
+        (['*ziggo*synced*.mka'], 'Ziggo', 'nld'),
+        (['*sporttv*synced*.mka'], 'Sport TV', 'por'),
+        (['*servustv*synced*.mka', '*stv*synced*.mka'], 'ServusTV', 'deu'),
+    ]
+
+    tracks = []
+    for globs, name, lang in patterns:
+        for pattern in globs:
+            matches = sorted(directory.glob(pattern))
+            if matches:
+                tracks.append((matches[0], name, lang))
+                break
+    return tracks
+
+
+def _detect_individual_tracks(directory):
+    """
+    Scan directory for per-race synced MKA files.
+    Returns dict: {'Moto3': [...], 'Moto2': [...], 'MotoGP': [...]}
+    Each entry is a list of (path, track_name, language) tuples.
+    """
+    result = {'Moto3': [], 'Moto2': [], 'MotoGP': []}
+
+    all_files = list(directory.glob('*.mka'))
+
+    # TNT (all races, one file each with race number prefix)
+    for f in all_files:
+        if '01.Race.Moto3' in f.name or (f.name.startswith('01') and 'tnt' in f.name.lower()):
+            result['Moto3'].append((f, 'TNT Sports', 'eng'))
+        elif '02.Race.Moto2' in f.name or (f.name.startswith('02') and 'tnt' in f.name.lower()):
+            result['Moto2'].append((f, 'TNT Sports', 'eng'))
+        elif '03.Race.MotoGP' in f.name or (f.name.startswith('03') and 'tnt' in f.name.lower()):
+            result['MotoGP'].append((f, 'TNT Sports', 'eng'))
+
+    # RTBF (Moto2 only for this round)
+    for f in all_files:
+        if 'rtbf' in f.name.lower() and 'moto2' in f.name.lower():
+            result['Moto2'].append((f, 'RTBF', 'fra'))
+
+    # RTS (MotoGP)
+    for f in all_files:
+        if 'rts' in f.name.lower() and 'moto' in f.name.lower() and 'rtbf' not in f.name.lower():
+            if 'Motorrad' not in f.name:  # SRF files have "Motorrad" in name
+                result['MotoGP'].append((f, 'RTS', 'fra'))
+
+    # SRF (MotoGP)
+    for f in all_files:
+        if 'Motorrad' in f.name and 'rts' in f.name.lower():
+            result['MotoGP'].append((f, 'SRF', 'deu'))
+
+    # ServusTV (all races)
+    for f in all_files:
+        if 'servustv' in f.name.lower() or 'stv' in f.name.lower():
+            if 'Moto3' in f.name:
+                result['Moto3'].append((f, 'ServusTV', 'deu'))
+            elif 'Moto2' in f.name:
+                result['Moto2'].append((f, 'ServusTV', 'deu'))
+            elif 'MotoGP' in f.name:
+                result['MotoGP'].append((f, 'ServusTV', 'deu'))
+
+    # evgenymotogp / Russian (all races)
+    for f in all_files:
+        if 'rus' in f.name.lower() or 'evgeny' in f.name.lower():
+            if 'Moto3' in f.name:
+                result['Moto3'].append((f, 'evgenymotogp', 'rus'))
+            elif 'Moto2' in f.name:
+                result['Moto2'].append((f, 'evgenymotogp', 'rus'))
+            elif 'MotoGP' in f.name:
+                result['MotoGP'].append((f, 'evgenymotogp', 'rus'))
+
+    return result
 
 
 if __name__ == '__main__':

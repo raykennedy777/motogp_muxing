@@ -193,15 +193,16 @@ def main():
         sys.argv.remove('--dry-run')
         print('[DRY RUN] Detection and segment planning only -- no audio will be encoded.')
 
-    anchor_source   = None
-    anchor_master   = None
-    template_time   = None
-    template_file   = None
-    program_start   = 0.0
-    min_break_secs  = 60
-    min_gap         = 0
-    max_std         = MAX_STD
-    min_stable_pct  = MIN_STABLE_PCT
+    anchor_source    = None
+    anchor_master    = None
+    template_time    = None
+    template_file    = None
+    template_averaged = False
+    program_start    = 0.0
+    min_break_secs   = 60
+    min_gap          = 0
+    max_std          = MAX_STD
+    min_stable_pct   = MIN_STABLE_PCT
     for arg in list(sys.argv[1:]):
         if arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
@@ -214,6 +215,9 @@ def main():
             sys.argv.remove(arg)
         elif arg.startswith('--template-file='):
             template_file = arg.split('=', 1)[1]
+            sys.argv.remove(arg)
+        elif arg == '--template-averaged':
+            template_averaged = True
             sys.argv.remove(arg)
         elif arg.startswith('--program-start='):
             program_start = float(arg.split('=', 1)[1])
@@ -234,8 +238,8 @@ def main():
     if anchor_source is None or anchor_master is None or len(sys.argv) != 4:
         sys.exit('Usage: sync_servustv.py [--dry-run] '
                  '--anchor-source=S --anchor-master=S '
-                 '[--template-time=S] [--template-file=F] [--program-start=S] '
-                 '[--min-break-secs=S] [--min-gap=S] '
+                 '[--template-time=S] [--template-file=F] [--template-averaged] '
+                 '[--program-start=S] [--min-break-secs=S] [--min-gap=S] '
                  '[--max-std=S] [--min-stable-pct=S] '
                  '<servustv_file> <master.mkv> <output_dir>')
 
@@ -269,17 +273,26 @@ def main():
         print(f'  Loading from {template_file}...')
         # TODO: Implement PNG loading if needed
         sys.exit('ERROR: --template-file not yet implemented')
+    elif template_averaged:
+        # Average frames ±60s around anchor_source in 5s steps
+        avg_start = anchor_source - 60.0
+        avg_end   = anchor_source + 60.0
+        print(f'  Averaging frames {fmt(avg_start)}-{fmt(avg_end)} (every 5s) around anchor...')
+        wm_template = build_watermark_template_averaged(
+            stv_file, avg_start, avg_end, 5.0,
+            WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
     elif template_time is not None:
         # User-specified time point
         print(f'  Extracting from stv {fmt(template_time)}...')
+        wm_template = build_watermark_template(
+            stv_file, template_time, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
     else:
-        # Default: use 25:00 (during live race, safe from ad breaks)
-        template_time = 1500  # 25:00
-        print(f'  Extracting from stv {fmt(template_time)} (default, during race)...')
-        print(f'  (use --template-time=S to specify a different reference)')
-    
-    wm_template = build_watermark_template(
-        stv_file, template_time, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
+        # Default: use anchor_source (known to be during live race coverage)
+        print(f'  Extracting from stv {fmt(anchor_source)} (anchor, during race)...')
+        print(f'  (use --template-averaged to average frames around anchor, '
+              f'or --template-time=S for a specific frame)')
+        wm_template = build_watermark_template(
+            stv_file, anchor_source, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
     if wm_template is None:
         sys.exit('ERROR: Could not build watermark template. Check file and coordinates.')
     print(f'  Template ready: crop={WM_W}x{WM_H}@({WM_X},{WM_Y}) -> {WM_OUT_W}x{WM_OUT_H}')
