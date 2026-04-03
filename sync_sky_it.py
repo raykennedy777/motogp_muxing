@@ -431,7 +431,7 @@ def main():
                             search_secs=MAX_BREAK_SECS, fps=2,
                             thresh=SKY_MGP_WM_THRESH, min_offset_secs=SKY_MGP_WM_MIN_OFFSET,
                             wm_lag_secs=0.0, tmp_suffix=f'_li{t_sting:.0f}',
-                            use_gradient=True, normalize_to_720p=True)
+                            use_gradient=True)
                         if found:
                             print(f'  MGP watermark return at {fmt(wm_end)} -> break_end')
                             fallback_breaks.append((break_start, wm_end))
@@ -473,7 +473,7 @@ def main():
                             search_secs=MAX_BREAK_SECS, fps=2,
                             thresh=SKY_MGP_WM_THRESH, min_offset_secs=SKY_MGP_WM_MIN_OFFSET,
                             wm_lag_secs=0.0, tmp_suffix=f'_lo{t_sting:.0f}',
-                            use_gradient=True, normalize_to_720p=True)
+                            use_gradient=True)
                         if found:
                             print(f'  MGP watermark return at {fmt(wm_end)} -> break_end')
                             fallback_breaks.append((break_start, wm_end))

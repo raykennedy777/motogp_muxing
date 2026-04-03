@@ -54,11 +54,12 @@ def build_watermark_template(src, ref_time, wm_x, wm_y, wm_w, wm_h,
              '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
             check=True, capture_output=True)
         full = np.frombuffer(result.stdout, dtype=np.uint8).astype(np.float32)
-        if len(full) != 1280 * 720:
-            print(f'  WARNING: Unexpected frame size: {len(full)} (expected {1280*720})')
+        src_w, src_h = get_video_dimensions(src)
+        if len(full) != src_w * src_h:
+            print(f'  WARNING: Unexpected frame size: {len(full)} (expected {src_w}x{src_h}={src_w*src_h})')
             return None
         # Slice exact window from full frame
-        rows = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
+        rows = [(wm_y + r) * src_w + wm_x for r in range(wm_h)]
         crop = np.concatenate([full[off:off + wm_w] for off in rows])
         # Resize to output size if needed
         if wm_w != out_w or wm_h != out_h:
@@ -143,8 +144,7 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
                                   search_secs=300, fps=2,
                                   thresh=0.44, min_offset_secs=30,
                                   wm_lag_secs=4.0, tmp_suffix='',
-                                  use_gradient=False,
-                                  normalize_to_720p=False):
+                                  use_gradient=False):
     """
     Detect break end by scanning for the watermark returning in live video.
     Extracts search_secs of video at fps frames/sec and correlates each frame
@@ -164,12 +164,11 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
     try:
         # Extract full frames (no crop) to avoid YUV420 chroma rounding issues.
         # The watermark window is sliced from the full frame in Python below.
-        vf = f'fps={fps},scale=1280:720' if normalize_to_720p else f'fps={fps}'
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{search_start:.3f}', '-t', f'{search_secs:.0f}',
              '-i', str(src),
-             '-vf', vf,
+             '-vf', f'fps={fps}',
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
         # WSL interop timing
@@ -188,7 +187,8 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
             os.remove(tmp)
         return None, False
 
-    frame_px = 1280 * 720  # full frame size
+    src_w, src_h = get_video_dimensions(src)
+    frame_px  = src_w * src_h
     n_frames  = len(frames) // frame_px
     step      = 1.0 / fps
     # For gradient mode: correlate edge magnitudes rather than raw pixel values.
@@ -202,7 +202,7 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
     min_frame = int(min_offset_secs * fps)
 
     # Pre-compute row offsets for slicing the watermark window from each full frame
-    row_offs = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
+    row_offs = [(wm_y + r) * src_w + wm_x for r in range(wm_h)]
 
     max_conf   = 0.0
     max_conf_t = search_start
@@ -385,7 +385,8 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
             os.remove(tmp)
         return []
 
-    frame_px = 1280 * 720
+    src_w, src_h = get_video_dimensions(src)
+    frame_px = src_w * src_h
     n_frames = len(frames) // frame_px
     if n_frames == 0:
         print('  WARNING: Watermark scan produced no frames.')
@@ -394,7 +395,7 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
     step = 1.0 / fps
     t0 = wm_template - wm_template.mean()
     t0_norm = np.linalg.norm(t0)
-    row_offs = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
+    row_offs = [(wm_y + r) * src_w + wm_x for r in range(wm_h)]
 
     # Compute per-frame correlation by slicing from full frames
     corrs = []
