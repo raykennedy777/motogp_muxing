@@ -83,11 +83,12 @@ WM_THRESH   = 0.44
 WM_FPS      = 2
 MIN_AD_CONF = 0.15  # reject regions where min_conf >= this (graphic obscuration)
 
-# New filters to reduce false positives:
-# True ad breaks have stable correlations (std < 0.11), graphics have std > 0.1
-MAX_STD = 0.12       # reject regions with correlation std > this
-# True ad breaks have >90% of frames with correlation around -0.265 (no watermark)
-MIN_STABLE_PCT = 50  # require at least this % of frames with stable -0.265
+# max_std / min_stable_pct: when set, reject regions whose correlation std exceeds
+# the threshold and require a stable-negative cluster.  Set to None to rely only
+# on min_break_secs and min_ad_conf — appropriate when full-screen ad breaks produce
+# variable (but consistently low) correlation due to diverse ad content.
+MAX_STD = None
+MIN_STABLE_PCT = None
 
 
 # ── Segment building ───────────────────────────────────────────────────────────
@@ -199,7 +200,7 @@ def main():
     template_file    = None
     template_averaged = False
     program_start    = 0.0
-    min_break_secs   = 60
+    min_break_secs   = 55
     min_gap          = 0
     max_std          = MAX_STD
     min_stable_pct   = MIN_STABLE_PCT
@@ -274,12 +275,14 @@ def main():
         # TODO: Implement PNG loading if needed
         sys.exit('ERROR: --template-file not yet implemented')
     elif template_averaged:
-        # Average frames ±60s around anchor_source in 5s steps
-        avg_start = anchor_source - 60.0
-        avg_end   = anchor_source + 60.0
-        print(f'  Averaging frames {fmt(avg_start)}-{fmt(avg_end)} (every 5s) around anchor...')
+        # Average 8 frames from anchor+3min through anchor+10min (1 per minute).
+        # Starting 3 minutes after anchor avoids pre-race sting / unusual visual moments
+        # that can occur right at the sync point and corrupt the template.
+        avg_start = anchor_source + 3 * 60
+        avg_end   = anchor_source + 10 * 60
+        print(f'  Averaging frames {fmt(avg_start)}-{fmt(avg_end)} (every 60s, 8 frames)...')
         wm_template = build_watermark_template_averaged(
-            stv_file, avg_start, avg_end, 5.0,
+            stv_file, avg_start, avg_end, 60.0,
             WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
     elif template_time is not None:
         # User-specified time point

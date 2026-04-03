@@ -63,8 +63,8 @@ def build_watermark_template(src, ref_time, wm_x, wm_y, wm_w, wm_h,
         crop = np.concatenate([full[off:off + wm_w] for off in rows])
         # Resize to output size if needed
         if wm_w != out_w or wm_h != out_h:
-            import tempfile as _tf
-            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_tpl_{int(time.time()*1000)}.raw')
+            import tempfile as _tf, time as _time
+            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_tpl_{int(_time.time()*1000)}.raw')
             subprocess.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
                      '-f','rawvideo','-pix_fmt','gray','-s',f'{wm_w}:{wm_h}',
                      '-i','pipe:0','-vf',f'scale={out_w}:{out_h}',
@@ -369,12 +369,18 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
     n_pixels = out_w * out_h
     tmp = f'_tmp_wm_allscan{tmp_suffix}.raw'
     try:
-        # Extract full frames to avoid YUV420 chroma rounding
+        # Extract only the watermark crop region, scaled to template size.
+        # This avoids loading full frames for a potentially very long scan window.
+        # YUV420 chroma rounding is not a concern here since we work in grayscale
+        # (luma-only) and the crop filter operates at full luma resolution.
+        vf = f'fps={fps},format=gray,crop={wm_w}:{wm_h}:{wm_x}:{wm_y}'
+        if wm_w != out_w or wm_h != out_h:
+            vf += f',scale={out_w}:{out_h}'
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{scan_start:.3f}', '-t', f'{scan_dur:.0f}',
              '-i', str(src),
-             '-vf', f'fps={fps}',
+             '-vf', vf,
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
         frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
@@ -385,9 +391,7 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
             os.remove(tmp)
         return []
 
-    src_w, src_h = get_video_dimensions(src)
-    frame_px = src_w * src_h
-    n_frames = len(frames) // frame_px
+    n_frames = len(frames) // n_pixels
     if n_frames == 0:
         print('  WARNING: Watermark scan produced no frames.')
         return []
@@ -395,23 +399,11 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
     step = 1.0 / fps
     t0 = wm_template - wm_template.mean()
     t0_norm = np.linalg.norm(t0)
-    row_offs = [(wm_y + r) * src_w + wm_x for r in range(wm_h)]
 
-    # Compute per-frame correlation by slicing from full frames
+    # Compute per-frame correlation directly from cropped frames
     corrs = []
     for i in range(n_frames):
-        frame = frames[i * frame_px:(i + 1) * frame_px]
-        crop = np.concatenate([frame[off:off + wm_w] for off in row_offs])
-        if wm_w != out_w or wm_h != out_h:
-            import subprocess as _sp, tempfile as _tf
-            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_all_{i}.raw')
-            _sp.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
-                     '-f','rawvideo','-pix_fmt','gray','-s',f'{wm_w}:{wm_h}',
-                     '-i','pipe:0','-vf',f'scale={out_w}:{out_h}',
-                     '-f','rawvideo','-pix_fmt','gray',_tmp],
-                    input=crop.astype(np.uint8).tobytes(), check=True)
-            crop = np.fromfile(_tmp, dtype=np.uint8).astype(np.float32)
-            if os.path.exists(_tmp): os.remove(_tmp)
+        crop  = frames[i * n_pixels:(i + 1) * n_pixels]
         f0    = crop - crop.mean()
         conf  = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
         corrs.append((scan_start + i * step, conf))
@@ -444,38 +436,37 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
             mean_conf = np.mean(corr_array)
             std_conf = np.std(corr_array)
             
-            # Check standard deviation filter (reject variable correlations)
-            if max_std is not None and std_conf > max_std:
-                print(f'  Skip: variable correlation {start_t:.1f}s-{end_t:.1f}s '
-                      f'({region_dur:.1f}s, std={std_conf:.3f} > max_std={max_std})')
-                return False
-            
-            # Check stable negative correlation pattern (true ad breaks have consistent values)
-            # The exact value depends on the template, so check for tight clustering
-            # rather than a specific value like -0.265
-            # Use middle 90% of frames to exclude edge effects
-            sorted_corrs = np.sort(corr_array)
-            n_trim = max(1, len(sorted_corrs) // 20)  # Trim 5% from each end
-            trimmed = sorted_corrs[n_trim:-n_trim] if n_trim > 0 else sorted_corrs
-            
-            corr_std = np.std(trimmed)
-            corr_range = np.max(trimmed) - np.min(trimmed)
-            
-            # True ad breaks have very stable correlations (low std, narrow range)
-            # Graphics/overlays have variable correlations (high std, wide range)
-            is_stable_negative = (corr_std < 0.08 and 
-                                  np.mean(trimmed) < 0 and
-                                  corr_range < 0.3)
-            
-            if not is_stable_negative:
-                print(f'  Skip: unstable correlation {start_t:.1f}s-{end_t:.1f}s '
-                      f'({region_dur:.1f}s, std={corr_std:.3f}, range={corr_range:.3f})')
-                return False
-            
-            # Require negative mean correlation (ad content has no watermark)
-            if mean_conf > 0:
+            # Check standard deviation filter (reject variable correlations).
+            # When max_std is set, also require the trimmed distribution to be
+            # tightly clustered and negative (stable-negative pattern).
+            # When max_std is None both checks are skipped — rely on min_break_secs
+            # and min_ad_conf alone (appropriate for full-screen ad breaks where
+            # diverse ad content produces variable but consistently low correlation).
+            if max_std is not None:
+                if std_conf > max_std:
+                    print(f'  Skip: variable correlation {start_t:.1f}s-{end_t:.1f}s '
+                          f'({region_dur:.1f}s, std={std_conf:.3f} > max_std={max_std})')
+                    return False
+
+                sorted_corrs = np.sort(corr_array)
+                n_trim = max(1, len(sorted_corrs) // 20)
+                trimmed = sorted_corrs[n_trim:-n_trim] if n_trim > 0 else sorted_corrs
+                corr_std   = np.std(trimmed)
+                corr_range = np.max(trimmed) - np.min(trimmed)
+                is_stable_negative = (corr_std < 0.08 and
+                                      np.mean(trimmed) < 0 and
+                                      corr_range < 0.3)
+                if not is_stable_negative:
+                    print(f'  Skip: unstable correlation {start_t:.1f}s-{end_t:.1f}s '
+                          f'({region_dur:.1f}s, std={corr_std:.3f}, range={corr_range:.3f})')
+                    return False
+
+            # Require near-zero or negative mean correlation (ad content has no watermark).
+            # Threshold > 0 to avoid rejecting real full-screen breaks where diverse
+            # ad content produces a near-zero (slightly positive) mean.
+            if mean_conf > 0.05:
                 print(f'  Skip: positive mean correlation {start_t:.1f}s-{end_t:.1f}s '
-                      f'({region_dur:.1f}s, mean={mean_conf:.3f} > 0)')
+                      f'({region_dur:.1f}s, mean={mean_conf:.3f} > 0.05)')
                 return False
 
         return True
