@@ -19,21 +19,60 @@ def get_video_dimensions(src):
     return int(w), int(h)
 
 
+def load_watermark_png(png_path):
+    """
+    Load a pre-built grayscale watermark template from a PNG file.
+    Returns a flat float32 array, or None on failure.
+    The PNG is decoded via ffmpeg to raw grayscale, so no PIL/Pillow required.
+    """
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+             '-i', str(png_path),
+             '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
+            check=True, capture_output=True)
+        arr = np.frombuffer(result.stdout, dtype=np.uint8).astype(np.float32)
+    except Exception as e:
+        print(f'  WARNING: Could not load watermark PNG {png_path}: {e}')
+        return None
+    return arr if len(arr) > 0 else None
+
+
 def build_watermark_template(src, ref_time, wm_x, wm_y, wm_w, wm_h,
                               out_w=32, out_h=32, tmp_suffix=''):
     """
     Extract a watermark reference template from a single frame at ref_time.
     ref_time must be during confirmed live on-track coverage (watermark present).
     Returns a flat float32 array of out_w*out_h pixels, or None on failure.
+    Uses full-frame extraction with Python slicing to avoid YUV420 chroma rounding.
     """
     try:
+        # Extract full frame, then crop and scale in Python
         result = subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{ref_time:.3f}', '-i', str(src), '-frames:v', '1',
-             '-vf', f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},scale={out_w}:{out_h}',
              '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
             check=True, capture_output=True)
-        arr = np.frombuffer(result.stdout, dtype=np.uint8).astype(np.float32)
+        full = np.frombuffer(result.stdout, dtype=np.uint8).astype(np.float32)
+        if len(full) != 1280 * 720:
+            print(f'  WARNING: Unexpected frame size: {len(full)} (expected {1280*720})')
+            return None
+        # Slice exact window from full frame
+        rows = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
+        crop = np.concatenate([full[off:off + wm_w] for off in rows])
+        # Resize to output size if needed
+        if wm_w != out_w or wm_h != out_h:
+            import tempfile as _tf
+            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_tpl_{int(time.time()*1000)}.raw')
+            subprocess.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
+                     '-f','rawvideo','-pix_fmt','gray','-s',f'{wm_w}:{wm_h}',
+                     '-i','pipe:0','-vf',f'scale={out_w}:{out_h}',
+                     '-f','rawvideo','-pix_fmt','gray',_tmp],
+                    input=crop.astype(np.uint8).tobytes(), check=True)
+            arr = np.fromfile(_tmp, dtype=np.uint8).astype(np.float32)
+            if os.path.exists(_tmp): os.remove(_tmp)
+        else:
+            arr = crop
     except Exception as e:
         print(f'  WARNING: Could not extract watermark template: {e}')
         return None
@@ -82,12 +121,30 @@ def build_watermark_template_averaged(src, start_time, end_time, interval,
     return np.mean(templates, axis=0)
 
 
+def _grad_mag(arr, w, h):
+    """
+    Compute gradient magnitude of a flat grayscale array (row-major, w×h).
+    Returns a flat float32 array of the same length.
+    Used by find_break_end_via_watermark(use_gradient=True) for edge-based
+    watermark detection, which is more robust when the watermark overlays
+    variable video content (e.g. Sky Italia MGP logo).
+    """
+    img = arr.reshape(h, w)
+    gx = np.zeros_like(img)
+    gy = np.zeros_like(img)
+    gx[:, 1:] = img[:, 1:] - img[:, :-1]
+    gy[1:, :] = img[1:, :] - img[:-1, :]
+    return np.sqrt(gx ** 2 + gy ** 2).ravel()
+
+
 def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
                                   wm_x, wm_y, wm_w, wm_h,
                                   out_w, out_h,
                                   search_secs=300, fps=2,
                                   thresh=0.44, min_offset_secs=30,
-                                  wm_lag_secs=4.0, tmp_suffix=''):
+                                  wm_lag_secs=4.0, tmp_suffix='',
+                                  use_gradient=False,
+                                  normalize_to_720p=False):
     """
     Detect break end by scanning for the watermark returning in live video.
     Extracts search_secs of video at fps frames/sec and correlates each frame
@@ -105,13 +162,14 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
     n_pixels = out_w * out_h
     tmp = os.path.join(tempfile.gettempdir(), f'_tmp_wm_probe_{int(time.time()*1000)}{tmp_suffix}.raw')
     try:
+        # Extract full frames (no crop) to avoid YUV420 chroma rounding issues.
+        # The watermark window is sliced from the full frame in Python below.
+        vf = f'fps={fps},scale=1280:720' if normalize_to_720p else f'fps={fps}'
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{search_start:.3f}', '-t', f'{search_secs:.0f}',
              '-i', str(src),
-             '-vf', (f'fps={fps},'
-                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},'
-                     f'scale={out_w}:{out_h}'),
+             '-vf', vf,
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
         # WSL interop timing
@@ -130,17 +188,44 @@ def find_break_end_via_watermark(src, break_start, clip_dur, wm_template,
             os.remove(tmp)
         return None, False
 
-    n_frames  = len(frames) // n_pixels
+    frame_px = 1280 * 720  # full frame size
+    n_frames  = len(frames) // frame_px
     step      = 1.0 / fps
-    t0        = wm_template - wm_template.mean()
+    # For gradient mode: correlate edge magnitudes rather than raw pixel values.
+    # This is robust to variable video backgrounds behind semi-transparent overlays.
+    if use_gradient:
+        tpl_signal = _grad_mag(wm_template.astype(np.float32), out_w, out_h)
+    else:
+        tpl_signal = wm_template
+    t0        = tpl_signal - tpl_signal.mean()
     t0_norm   = np.linalg.norm(t0)
     min_frame = int(min_offset_secs * fps)
+
+    # Pre-compute row offsets for slicing the watermark window from each full frame
+    row_offs = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
 
     max_conf   = 0.0
     max_conf_t = search_start
     for i in range(n_frames):
-        frame = frames[i * n_pixels:(i + 1) * n_pixels]
-        f0    = frame - frame.mean()
+        frame = frames[i * frame_px:(i + 1) * frame_px]
+        # Slice exact watermark window from full frame
+        crop = np.concatenate([frame[off:off + wm_w] for off in row_offs])
+        # Resize to template size if needed
+        if wm_w != out_w or wm_h != out_h:
+            import subprocess as _sp, tempfile as _tf
+            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_scale_{i}.raw')
+            _sp.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
+                     '-f','rawvideo','-pix_fmt','gray','-s',f'{wm_w}:{wm_h}',
+                     '-i','pipe:0','-vf',f'scale={out_w}:{out_h}',
+                     '-f','rawvideo','-pix_fmt','gray',_tmp],
+                    input=crop.astype(np.uint8).tobytes(), check=True)
+            crop = np.fromfile(_tmp, dtype=np.uint8).astype(np.float32)
+            if os.path.exists(_tmp): os.remove(_tmp)
+        if use_gradient:
+            signal = _grad_mag(crop, out_w, out_h)
+        else:
+            signal = crop
+        f0    = signal - signal.mean()
         conf  = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
         t_i   = search_start + i * step
         if conf > max_conf:
@@ -173,13 +258,12 @@ def find_break_start_via_watermark(src, sting_time, wm_template,
     n_pixels = out_w * out_h
     tmp = os.path.join(tempfile.gettempdir(), f'_tmp_wm_break_start_{int(time.time()*1000)}{tmp_suffix}.raw')
     try:
+        # Extract full frames to avoid YUV420 chroma rounding
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{search_start:.3f}', '-t', f'{search_dur:.1f}',
              '-i', str(src),
-             '-vf', (f'fps={fps},'
-                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},'
-                     f'scale={out_w}:{out_h}'),
+             '-vf', f'fps={fps}',
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
         for _ in range(10):
@@ -197,20 +281,33 @@ def find_break_start_via_watermark(src, sting_time, wm_template,
             os.remove(tmp)
         return None, False
 
-    n_frames = len(frames) // n_pixels
+    frame_px = 1280 * 720
+    n_frames = len(frames) // frame_px
     if n_frames == 0:
         return None, False
 
     step = 1.0 / fps
     t0 = wm_template - wm_template.mean()
     t0_norm = np.linalg.norm(t0)
+    row_offs = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
 
     last_visible_t = None
     in_break = False
 
     for i in range(n_frames):
-        frame = frames[i * n_pixels:(i + 1) * n_pixels]
-        f0 = frame - frame.mean()
+        frame = frames[i * frame_px:(i + 1) * frame_px]
+        crop = np.concatenate([frame[off:off + wm_w] for off in row_offs])
+        if wm_w != out_w or wm_h != out_h:
+            import subprocess as _sp, tempfile as _tf
+            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_bs_{i}.raw')
+            _sp.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
+                     '-f','rawvideo','-pix_fmt','gray','-s',f'{wm_w}:{wm_h}',
+                     '-i','pipe:0','-vf',f'scale={out_w}:{out_h}',
+                     '-f','rawvideo','-pix_fmt','gray',_tmp],
+                    input=crop.astype(np.uint8).tobytes(), check=True)
+            crop = np.fromfile(_tmp, dtype=np.uint8).astype(np.float32)
+            if os.path.exists(_tmp): os.remove(_tmp)
+        f0 = crop - crop.mean()
         conf = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
         t_i = search_start + i * step
 
@@ -272,13 +369,12 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
     n_pixels = out_w * out_h
     tmp = f'_tmp_wm_allscan{tmp_suffix}.raw'
     try:
+        # Extract full frames to avoid YUV420 chroma rounding
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{scan_start:.3f}', '-t', f'{scan_dur:.0f}',
              '-i', str(src),
-             '-vf', (f'fps={fps},'
-                     f'crop={wm_w}:{wm_h}:{wm_x}:{wm_y},'
-                     f'scale={out_w}:{out_h}'),
+             '-vf', f'fps={fps}',
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
         frames = np.fromfile(tmp, dtype=np.uint8).astype(np.float32)
@@ -289,7 +385,8 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
             os.remove(tmp)
         return []
 
-    n_frames = len(frames) // n_pixels
+    frame_px = 1280 * 720
+    n_frames = len(frames) // frame_px
     if n_frames == 0:
         print('  WARNING: Watermark scan produced no frames.')
         return []
@@ -297,12 +394,24 @@ def find_all_breaks_via_watermark(src, wm_template, wm_x, wm_y, wm_w, wm_h,
     step = 1.0 / fps
     t0 = wm_template - wm_template.mean()
     t0_norm = np.linalg.norm(t0)
+    row_offs = [(wm_y + r) * 1280 + wm_x for r in range(wm_h)]
 
-    # Compute per-frame correlation
+    # Compute per-frame correlation by slicing from full frames
     corrs = []
     for i in range(n_frames):
-        frame = frames[i * n_pixels:(i + 1) * n_pixels]
-        f0    = frame - frame.mean()
+        frame = frames[i * frame_px:(i + 1) * frame_px]
+        crop = np.concatenate([frame[off:off + wm_w] for off in row_offs])
+        if wm_w != out_w or wm_h != out_h:
+            import subprocess as _sp, tempfile as _tf
+            _tmp = os.path.join(_tf.gettempdir(), f'_tmp_wm_all_{i}.raw')
+            _sp.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
+                     '-f','rawvideo','-pix_fmt','gray','-s',f'{wm_w}:{wm_h}',
+                     '-i','pipe:0','-vf',f'scale={out_w}:{out_h}',
+                     '-f','rawvideo','-pix_fmt','gray',_tmp],
+                    input=crop.astype(np.uint8).tobytes(), check=True)
+            crop = np.fromfile(_tmp, dtype=np.uint8).astype(np.float32)
+            if os.path.exists(_tmp): os.remove(_tmp)
+        f0    = crop - crop.mean()
         conf  = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
         corrs.append((scan_start + i * step, conf))
 

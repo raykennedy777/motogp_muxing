@@ -17,12 +17,18 @@ and a three-tier break detection strategy:
   2. PUBBLICITÀ text detection (secondary — break START fallback)
      A white "PUBBLICITÀ" overlay appears in the bottom-right at the
      start of the bumper clip that precedes each ad block. Template-matched
-     against a reference frame. Used to detect starts not caught by stings.
+     against a pre-built fingerprint (fingerprints/sky_it_pubb.png).
+     Used to detect starts not caught by stings.
 
   3. MGP logo watermark reappearance (secondary — break END fallback)
      The MGP logo (bottom-right) disappears during ads and reappears when
-     program resumes. Used only to find the END of a break whose start was
-     found via PUBBLICITÀ. Stings are used for break ends when available.
+     program resumes. Uses a pre-built fingerprint (fingerprints/sky_it_mgp.png).
+     Used to find the END of a break whose start was found via PUBBLICITÀ
+     when no lead-out sting is present.
+
+Pre-built templates:
+  Run extract_sky_templates.py once per broadcast season to generate
+  fingerprints/sky_it_mgp.png and fingerprints/sky_it_pubb.png.
 
 Output structure:
   1. Natural Sounds from master   t = 0             → sky_start_master
@@ -46,62 +52,63 @@ from pathlib import Path
 from audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
 from sting_detection import find_all_transitions, find_sting
-from watermark_detection import build_watermark_template, find_break_end_via_watermark, \
+from watermark_detection import load_watermark_png, find_break_end_via_watermark, \
                                 find_break_start_via_watermark
 
 FP_DIR         = Path(__file__).parent / 'fingerprints'
-MAX_BREAK_SECS = 420    # 7 min — discard sting pairings longer than this
-WM_FALLBACK_SECS = 60.0 # break-end fallback when watermark search fails
+STING_PAIR_GAP_SECS = 480  # 8 min — max sting-start gap to form a pair
+MAX_BREAK_SECS      = 420  # 7 min — max break duration for sanity checks
+WM_FALLBACK_SECS    = 60.0 # break-end fallback when watermark search fails
 
 # ── PUBBLICITÀ text region (bottom-right, 1280×720) — break START indicator ──
-SKY_PUBB_X,     SKY_PUBB_Y     = 1040, 615
-SKY_PUBB_W,     SKY_PUBB_H     = 220,  50
-SKY_PUBB_OUT_W, SKY_PUBB_OUT_H = 48,   12
+SKY_PUBB_X,     SKY_PUBB_Y     = 1107, 609
+SKY_PUBB_W,     SKY_PUBB_H     = 100,  35
+SKY_PUBB_OUT_W, SKY_PUBB_OUT_H = 100,  35
 SKY_PUBB_THRESH       = 0.70   # text is very distinctive; high threshold
 SKY_PUBB_SUPPRESS_SECS = 120   # min gap between detections (same break)
 
 # ── MGP logo watermark region (bottom-right, 1280×720) — break END indicator ──
-SKY_MGP_WM_X,     SKY_MGP_WM_Y     = 1100, 645
-SKY_MGP_WM_W,     SKY_MGP_WM_H     = 120,  50
-SKY_MGP_OUT_W,    SKY_MGP_OUT_H    = 32,   16
-SKY_MGP_WM_THRESH    = 0.55    # program 0.76–0.86; ad spikes max ~0.51
+SKY_MGP_WM_X,     SKY_MGP_WM_Y     = 1124, 662
+SKY_MGP_WM_W,     SKY_MGP_WM_H     = 115,  43
+SKY_MGP_OUT_W,    SKY_MGP_OUT_H    = 115,  43
+SKY_MGP_WM_THRESH    = 0.28    # gradient mode: program ~0.31–0.44; ad spikes max ~0.37; no ad frames reach 0.28 in search windows
 SKY_MGP_WM_MIN_OFFSET = 20     # don't look for return within first 20s
 
 
 # ── Break pairing ─────────────────────────────────────────────────────────────
 
-def _pair_from(events, start_idx, verbose=True):
-    """Strictly pair events starting at start_idx: (start_idx, start_idx+1), ..."""
-    pairs = []
-    for i in range(start_idx, len(events) - 1, 2):
-        s   = events[i][0]
-        e   = events[i + 1][0] + events[i + 1][2]   # time + clip_dur
-        dur = e - s
-        if dur > MAX_BREAK_SECS:
-            if verbose:
-                print(f'  (offset={start_idx}) pair {fmt(s)}-{fmt(e)} '
-                      f'is {dur:.0f}s > {MAX_BREAK_SECS}s -- skipping')
-        else:
-            pairs.append((s, e))
-    return pairs
-
-
 def pair_breaks(events):
     """
-    Pair sting events as (lead-in, lead-out) breaks.
-    Tries pairing from index 0 and index 1 (skipping a possible orphaned
-    lead-out at the start of the broadcast), and uses whichever yields
-    more valid pairs. Returns (pairs, used_offset_1).
+    Pair sting events by proximity: consecutive stings whose start times are
+    within STING_PAIR_GAP_SECS of each other are treated as (lead-in, lead-out)
+    pairs. Any sting that cannot be paired is returned as orphaned.
+
+    Returns (pairs, orphaned_events).
     """
     if not events:
-        return [], False
-    p0 = _pair_from(events, 0)
-    p1 = _pair_from(events, 1, verbose=False)
-    if len(p1) > len(p0):
-        print(f'  NOTE: offset-1 pairing gives more valid pairs ({len(p1)} vs {len(p0)}); '
-              f'first sting treated as orphaned lead-out.')
-        return p1, True
-    return p0, False
+        return [], []
+    pairs    = []
+    orphaned = []
+    i = 0
+    while i < len(events):
+        if i + 1 < len(events):
+            gap = events[i + 1][0] - events[i][0]
+            if gap <= STING_PAIR_GAP_SECS:
+                s = events[i][0]
+                e = events[i + 1][0] + events[i + 1][2]
+                print(f'  Pair: {fmt(s)}-{fmt(e)}  gap={gap:.1f}s  dur={e-s:.1f}s')
+                pairs.append((s, e))
+                i += 2
+            else:
+                print(f'  Orphaned (next sting {gap:.1f}s away > {STING_PAIR_GAP_SECS}s): '
+                      f'{fmt(events[i][0])}  conf={events[i][1]:.4f}')
+                orphaned.append(events[i])
+                i += 1
+        else:
+            print(f'  Orphaned (last sting): {fmt(events[i][0])}  conf={events[i][1]:.4f}')
+            orphaned.append(events[i])
+            i += 1
+    return pairs, orphaned
 
 
 # ── PUBBLICITÀ detection ───────────────────────────────────────────────────────
@@ -122,12 +129,11 @@ def find_pubblicita_starts(src, template, scan_start=0.0, scan_end=0.0,
     import time, tempfile
     tmp = os.path.join(tempfile.gettempdir(), f'_tmp_pubb_scan_{int(time.time()*1000)}.raw')
     try:
+        # Extract full frames to avoid YUV420 chroma rounding
         subprocess.run(
             ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
              '-ss', f'{scan_start:.3f}', '-t', f'{scan_dur:.0f}', '-i', str(src),
-             '-vf', (f'fps={fps},'
-                     f'crop={SKY_PUBB_W}:{SKY_PUBB_H}:{SKY_PUBB_X}:{SKY_PUBB_Y},'
-                     f'scale={SKY_PUBB_OUT_W}:{SKY_PUBB_OUT_H}'),
+             '-vf', f'fps={fps},scale=1280:720',
              '-f', 'rawvideo', '-pix_fmt', 'gray', tmp],
             check=True)
         # WSL interop timing
@@ -146,17 +152,30 @@ def find_pubblicita_starts(src, template, scan_start=0.0, scan_end=0.0,
             os.remove(tmp)
         return []
 
-    n_frames = len(frames) // n_pixels
+    frame_px = 1280 * 720
+    n_frames = len(frames) // frame_px
     step = 1.0 / fps
     t0 = template - template.mean()
     t0_norm = np.linalg.norm(t0)
+    row_offs = [(SKY_PUBB_Y + r) * 1280 + SKY_PUBB_X for r in range(SKY_PUBB_H)]
 
     detections  = []
     last_detect = -suppress_secs
 
     for i in range(n_frames):
-        frame = frames[i * n_pixels:(i + 1) * n_pixels]
-        f0    = frame - frame.mean()
+        frame = frames[i * frame_px:(i + 1) * frame_px]
+        crop = np.concatenate([frame[off:off + SKY_PUBB_W] for off in row_offs])
+        if SKY_PUBB_W != SKY_PUBB_OUT_W or SKY_PUBB_H != SKY_PUBB_OUT_H:
+            import subprocess as _sp
+            _tmp = os.path.join(tempfile.gettempdir(), f'_tmp_pubb_s_{i}.raw')
+            _sp.run(['ffmpeg','-y','-hide_banner','-loglevel','error',
+                     '-f','rawvideo','-pix_fmt','gray','-s',f'{SKY_PUBB_W}:{SKY_PUBB_H}',
+                     '-i','pipe:0','-vf',f'scale={SKY_PUBB_OUT_W}:{SKY_PUBB_OUT_H}',
+                     '-f','rawvideo','-pix_fmt','gray',_tmp],
+                    input=crop.astype(np.uint8).tobytes(), check=True)
+            crop = np.fromfile(_tmp, dtype=np.uint8).astype(np.float32)
+            if os.path.exists(_tmp): os.remove(_tmp)
+        f0    = crop - crop.mean()
         conf  = np.dot(f0, t0) / (np.linalg.norm(f0) * t0_norm + 1e-10)
         t_i   = scan_start + i * step
         if conf >= thresh and (t_i - last_detect) >= suppress_secs:
@@ -297,6 +316,7 @@ def main():
     fp_leadin = str(FP_DIR / 'sky_it_leadin.wav')
     if not Path(fp_leadin).exists():
         sys.exit(f'ERROR: Missing fingerprint: {fp_leadin}')
+    fp_leadin_dur = get_duration(fp_leadin)
 
     # ── Offset ──
     offset = anchor_source - anchor_master
@@ -320,8 +340,8 @@ def main():
     print('\nScanning Sky IT for ad break stings...')
     events = find_all_transitions(sky_file, [fp_leadin], stream_spec='0:a:0')
 
-    sting_breaks = []
-    unpaired_stings = []
+    sting_breaks    = []
+    orphaned_stings = []
 
     if not events:
         print('  No sting events found.')
@@ -329,31 +349,7 @@ def main():
         print(f'  {len(events)} sting events:')
         for t, c, d in events:
             print(f'    {fmt(t)}  conf={c:.4f}  clip_dur={d:.1f}s')
-        sting_breaks, used_offset_1 = pair_breaks(events)
-
-        # When the first sting is an orphaned lead-out, the preceding break's
-        # lead-in may have been missed due to the suppression window
-        # (lead-in and lead-out too close together to both survive dedup).
-        # Re-scan with find_sting (no suppression) in the window before it.
-        if used_offset_1:
-            orphaned_t   = events[0][0]
-            orphaned_dur = events[0][2]
-            t_break_end  = orphaned_t + orphaned_dur
-            rescan_start = max(0.0, orphaned_t - MAX_BREAK_SECS)
-            rescan_dur   = orphaned_t - rescan_start - 10  # stop 10s before lead-out
-            if rescan_dur > 5:
-                print(f'\n  Rescanning before orphaned lead-out ({fmt(orphaned_t)}) '
-                      f'for missed lead-in...')
-                t_li, conf_li = find_sting(sky_file, fp_leadin,
-                                           rescan_start, rescan_dur,
-                                           stream_spec='0:a:0')
-                if conf_li >= 0.3:
-                    print(f'  Lead-in found at {fmt(t_li)} (conf={conf_li:.4f}); '
-                          f'adding break {fmt(t_li)}-{fmt(t_break_end)}')
-                    sting_breaks.insert(0, (t_li, t_break_end))
-                else:
-                    print(f'  No lead-in found before orphaned lead-out '
-                          f'(best conf={conf_li:.4f}).')
+        sting_breaks, orphaned_stings = pair_breaks(events)
 
         if sting_breaks:
             print(f'\n  {len(sting_breaks)} sting-detected breaks:')
@@ -364,90 +360,129 @@ def main():
         else:
             print('  No valid sting pairs formed.')
 
-        # Identify unpaired stings for watermark-based break start detection
-        paired_times = set()
-        for s, e in sting_breaks:
-            paired_times.add(s)
-            paired_times.add(e)
-        unpaired_stings = [(t, c, d) for t, c, d in events if t not in paired_times]
-        if unpaired_stings:
-            print(f'\n  {len(unpaired_stings)} unpaired sting(s):')
-            for t, c, d in unpaired_stings:
+        if orphaned_stings:
+            print(f'\n  {len(orphaned_stings)} orphaned sting(s):')
+            for t, c, d in orphaned_stings:
                 print(f'    {fmt(t)}  conf={c:.4f}  clip_dur={d:.1f}s')
 
     # ══════════════════════════════════════════════════════════════════════════
-    # TIER 2 + 3: PUBBLICITÀ (break start) + MGP watermark (break end)
-    # Only scan near unpaired stings (300s window before each)
+    # TIER 2 + 3: Orphaned sting role determination
+    #
+    # For each orphaned sting, determine its role:
+    #   Lead-in:  PUBBLICITÀ appears within 30s of sting end
+    #             break_start = sting_start
+    #             break_end   = lead-out sting (from sting_end) or MGP watermark
+    #   Lead-out: no PUBBLICITÀ within 30s of sting end
+    #             break_end   = sting_end
+    #             break_start = PUBBLICITÀ found in 7-min look-back window
     # ══════════════════════════════════════════════════════════════════════════
     fallback_breaks = []
     if not sting_only:
-      print('\nBuilding templates for secondary detection...')
-      mgp_template  = build_watermark_template(
-          sky_file, ref_time=anchor_source,
-          wm_x=SKY_MGP_WM_X,  wm_y=SKY_MGP_WM_Y,
-          wm_w=SKY_MGP_WM_W,  wm_h=SKY_MGP_WM_H,
-          out_w=SKY_MGP_OUT_W, out_h=SKY_MGP_OUT_H)
+        print('\nLoading watermark templates from fingerprints...')
+        mgp_path      = FP_DIR / 'sky_it_mgp.png'
+        pubb_path     = FP_DIR / 'sky_it_pubb.png'
+        mgp_template  = load_watermark_png(mgp_path)
+        pubb_template = load_watermark_png(pubb_path)
 
-      # PUBBLICITÀ template: extracted from a frame where the text is visible.
-      # The text appears on the bumper clip at the start of every ad break.
-      pubb_ref = 1179.5   # seconds into this broadcast — adjust if clip changes
-      pubb_template = build_watermark_template(
-          sky_file, ref_time=pubb_ref,
-          wm_x=SKY_PUBB_X,     wm_y=SKY_PUBB_Y,
-          wm_w=SKY_PUBB_W,     wm_h=SKY_PUBB_H,
-          out_w=SKY_PUBB_OUT_W, out_h=SKY_PUBB_OUT_H)
+        if pubb_template is not None and mgp_template is not None:
+            pubb_used_times = set()
+            for t_sting, sting_conf, clip_dur in orphaned_stings:
+                sting_end = t_sting + clip_dur
 
-      if pubb_template is not None and mgp_template is not None:
-        # Only scan for PUBBLICITÀ near unpaired stings
-        pubb_used_times = set()  # Track PUBBLICITÀ times already used
-        for t_sting, conf, clip_dur in unpaired_stings:
-          # Skip if already covered by a sting break
-          if any(s - 60 <= t_sting <= e + 30 for s, e in sting_breaks):
-            continue
+                print(f'\n  Checking role of orphaned sting at {fmt(t_sting)} '
+                      f'(end={fmt(sting_end)}, conf={sting_conf:.4f})...')
 
-          # Scan 300s before the unpaired sting for PUBBLICITÀ
-          scan_start = max(0.0, t_sting - 300.0)
-          scan_end = t_sting
-          print(f'\n  Scanning for PUBBLICITÀ before unpaired sting at {fmt(t_sting)}...')
-          pubb_hits = find_pubblicita_starts(
-              sky_file, pubb_template,
-              scan_start=scan_start, scan_end=scan_end,
-              fps=1, thresh=SKY_PUBB_THRESH,
-              suppress_secs=SKY_PUBB_SUPPRESS_SECS)
+                # ── Step A: PUBBLICITÀ within 30s of sting end? ───────────
+                pubb_hits = find_pubblicita_starts(
+                    sky_file, pubb_template,
+                    scan_start=sting_end,
+                    scan_end=sting_end + 30.0,
+                    fps=1, thresh=SKY_PUBB_THRESH,
+                    suppress_secs=SKY_PUBB_SUPPRESS_SECS)
+                pubb_hits = [(t, c) for t, c in pubb_hits
+                             if not any(abs(t - u) < 30 for u in pubb_used_times)]
 
-          # Filter out PUBBLICITÀ times already used
-          pubb_hits = [(t, c) for t, c in pubb_hits
-                       if not any(abs(t - used) < 30 for used in pubb_used_times)]
-          # Filter out PUBBLICITÀ too close to file start (pre-show bumpers)
-          pubb_hits = [(t, c) for t, c in pubb_hits if t >= 60.0]
-          # Filter out PUBBLICITÀ too close to file start (pre-show bumpers)
-          pubb_hits = [(t, c) for t, c in pubb_hits if t >= 60.0]
+                if pubb_hits:
+                    # ── Lead-in ───────────────────────────────────────────
+                    pubb_t, pubb_conf = pubb_hits[0]
+                    pubb_used_times.add(pubb_t)
+                    print(f'  PUBBLICITÀ at {fmt(pubb_t)} (conf={pubb_conf:.4f}) '
+                          f'within 30s of sting end -> LEAD-IN')
+                    break_start = t_sting
 
-          if not pubb_hits:
-            print(f'    No PUBBLICITÀ found in {fmt(scan_start)}-{fmt(scan_end)}')
-            continue
+                    # Find break end: lead-out sting from sting_end (primary)
+                    end_t, end_conf = find_sting(
+                        sky_file, fp_leadin,
+                        sting_end, MAX_BREAK_SECS,
+                        stream_spec='0:a:0')
+                    if end_conf >= 0.3:
+                        break_end = end_t + fp_leadin_dur
+                        print(f'  Lead-out sting at {fmt(end_t)} (conf={end_conf:.4f}) '
+                              f'-> break_end={fmt(break_end)}')
+                        fallback_breaks.append((break_start, break_end))
+                    else:
+                        # MGP watermark reappearance fallback
+                        print(f'  No lead-out sting (best conf={end_conf:.4f}); '
+                              f'searching for MGP watermark return...')
+                        wm_end, found = find_break_end_via_watermark(
+                            sky_file, t_sting, clip_dur, mgp_template,
+                            SKY_MGP_WM_X, SKY_MGP_WM_Y, SKY_MGP_WM_W, SKY_MGP_WM_H,
+                            SKY_MGP_OUT_W, SKY_MGP_OUT_H,
+                            search_secs=MAX_BREAK_SECS, fps=2,
+                            thresh=SKY_MGP_WM_THRESH, min_offset_secs=SKY_MGP_WM_MIN_OFFSET,
+                            wm_lag_secs=0.0, tmp_suffix=f'_li{t_sting:.0f}',
+                            use_gradient=True, normalize_to_720p=True)
+                        if found:
+                            print(f'  MGP watermark return at {fmt(wm_end)} -> break_end')
+                            fallback_breaks.append((break_start, wm_end))
+                        else:
+                            print(f'  No watermark found either; skipping this break')
 
-          # Use the latest PUBBLICITÀ hit (closest to the sting)
-          pubb_t, pubb_conf = pubb_hits[-1]
-          pubb_used_times.add(pubb_t)
-          print(f'    PUBBLICITÀ at {fmt(pubb_t)} (conf={pubb_conf:.4f})')
+                else:
+                    # ── Lead-out: scan 7 min before sting for PUBBLICITÀ ──
+                    print(f'  No PUBBLICITÀ within 30s of sting end -> LEAD-OUT  '
+                          f'break_end={fmt(sting_end)}')
+                    scan_start = max(0.0, t_sting - MAX_BREAK_SECS)
+                    print(f'  Scanning for PUBBLICITÀ in {fmt(scan_start)}-{fmt(t_sting)}...')
+                    pubb_hits = find_pubblicita_starts(
+                        sky_file, pubb_template,
+                        scan_start=scan_start, scan_end=t_sting,
+                        fps=1, thresh=SKY_PUBB_THRESH,
+                        suppress_secs=SKY_PUBB_SUPPRESS_SECS)
+                    pubb_hits = [(t, c) for t, c in pubb_hits
+                                 if t >= 60.0
+                                 and not any(abs(t - u) < 30 for u in pubb_used_times)]
 
-          # Find break end: search for sting AFTER PUBBLICITÀ (primary)
-          print(f'    Searching for sting after PUBBLICITÀ (within {MAX_BREAK_SECS}s)...')
-          end_t, end_conf = find_sting(
-              sky_file, fp_leadin,
-              search_start=pubb_t + 5.0,  # skip 5s after PUBBLICITÀ
-              search_dur=MAX_BREAK_SECS,
-              stream_spec='0:a:0',
-              label=f'    Sting after PUBBLICITÀ')
-
-          if end_conf >= 0.3:
-            print(f'    Sting found at {fmt(end_t)} (conf={end_conf:.4f}) — break end')
-            fallback_breaks.append((pubb_t, end_t))
-          else:
-            print(f'    No sting found after PUBBLICITÀ; skipping this break')
-      else:
-          print('  WARNING: Could not build templates; skipping secondary detection.')
+                    if pubb_hits:
+                        pubb_t, pubb_conf = pubb_hits[-1]  # latest = closest to sting
+                        pubb_used_times.add(pubb_t)
+                        print(f'  PUBBLICITÀ at {fmt(pubb_t)} (conf={pubb_conf:.4f}) '
+                              f'-> break_start={fmt(pubb_t)}  break_end={fmt(sting_end)}')
+                        fallback_breaks.append((pubb_t, sting_end))
+                    else:
+                        # No PUBBLICITÀ in either direction — cannot confirm role via PUBBLICITÀ.
+                        # Treat as lead-in (break_start = sting_start) and use MGP watermark
+                        # to find the break end.
+                        print(f'  No PUBBLICITÀ in look-back either; treating as LEAD-IN, '
+                              f'searching for MGP watermark return...')
+                        break_start = t_sting
+                        wm_end, found = find_break_end_via_watermark(
+                            sky_file, t_sting, clip_dur, mgp_template,
+                            SKY_MGP_WM_X, SKY_MGP_WM_Y, SKY_MGP_WM_W, SKY_MGP_WM_H,
+                            SKY_MGP_OUT_W, SKY_MGP_OUT_H,
+                            search_secs=MAX_BREAK_SECS, fps=2,
+                            thresh=SKY_MGP_WM_THRESH, min_offset_secs=SKY_MGP_WM_MIN_OFFSET,
+                            wm_lag_secs=0.0, tmp_suffix=f'_lo{t_sting:.0f}',
+                            use_gradient=True, normalize_to_720p=True)
+                        if found:
+                            print(f'  MGP watermark return at {fmt(wm_end)} -> break_end')
+                            fallback_breaks.append((break_start, wm_end))
+                        else:
+                            print(f'  No watermark found either; skipping this break')
+        else:
+            print('  WARNING: Could not load watermark templates; skipping secondary detection.')
+            print('  Run extract_sky_templates.py to generate '
+                  'fingerprints/sky_it_mgp.png and fingerprints/sky_it_pubb.png')
 
     # ── Merge: sting breaks (primary) + PUBBLICITÀ/sting (fallback) ──
     breaks = sorted(sting_breaks + fallback_breaks)
