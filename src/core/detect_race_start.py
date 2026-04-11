@@ -19,7 +19,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 os.chdir(SCRIPT_DIR)
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from audio_utils import SR, get_duration, extract_wav, load_fp_wav, _peak, fmt
+from src.utils.audio_utils import SR, get_duration, extract_wav, load_fp_wav, _peak, fmt
 
 SRC = "/mnt/c/Users/raisi/Downloads/MotoGP.2026.Round03.USA.Race.WEB-DL.1080p.H264.English-MWR/MotoGP.2026.Round03.USA.Race.WEB-DL.1080p.H264.English-MWR.mkv"
 FP_PATH = str(SCRIPT_DIR / "fingerprints" / "prerace_sting_motogp.wav")

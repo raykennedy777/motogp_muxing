@@ -26,8 +26,8 @@ Usage:
 import sys, os
 from pathlib import Path
 
-from audio_utils import SR, fmt, get_duration, extract_wav, extract_seg, load_fp_wav, _peak, concat_segments_to_mka
-from sting_detection import CONF_THRESH, find_sting, find_all_transitions
+from src.utils.audio_utils import SR, fmt, get_duration, extract_wav, extract_seg, load_fp_wav, _peak, concat_segments_to_mka
+from src.utils.sting_detection import CONF_THRESH, find_sting, find_all_transitions
 from watermark_detection import build_watermark_template, find_break_end_via_watermark
 
 # Search window for Moto3 sting in web master (absolute)

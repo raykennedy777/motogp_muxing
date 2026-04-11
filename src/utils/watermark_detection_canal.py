@@ -216,7 +216,7 @@ def main():
                         help='Test on a small segment around a known break')
     args = parser.parse_args()
 
-    from audio_utils import get_duration
+    from .audio_utils import get_duration
     d = get_duration(args.src)
     total_frames = int(d * args.fps)
     end_frame = args.end_frame or total_frames

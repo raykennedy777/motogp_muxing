@@ -49,10 +49,10 @@ import subprocess, os, sys
 import numpy as np
 from pathlib import Path
 
-from audio_utils import fmt, get_duration, get_audio_stream_count, \
+from src.utils.audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
-from sting_detection import find_all_transitions, find_sting
-from watermark_detection import load_watermark_png, find_break_end_via_watermark, \
+from src.utils.sting_detection import find_all_transitions, find_sting
+from src.utils.watermark_detection import load_watermark_png, find_break_end_via_watermark, \
                                 find_break_start_via_watermark
 
 FP_DIR         = Path(__file__).parent / 'fingerprints'

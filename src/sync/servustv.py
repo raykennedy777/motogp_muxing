@@ -61,7 +61,7 @@ Usage:
 import sys
 from pathlib import Path
 
-from audio_utils import fmt, get_duration, get_audio_stream_count, \
+from src.utils.audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
 from watermark_detection import (build_watermark_template,
                                   build_watermark_template_averaged,

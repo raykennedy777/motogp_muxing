@@ -27,9 +27,9 @@ import sys, os, subprocess, argparse
 import numpy as np
 from pathlib import Path
 
-from audio_utils import SR, get_duration, get_audio_stream_count, extract_wav, extract_seg, concat_segments_to_mka
-from sting_detection import find_sting, find_all_transitions
-from watermark_detection import build_watermark_template
+from src.utils.audio_utils import SR, get_duration, get_audio_stream_count, extract_wav, extract_seg, concat_segments_to_mka
+from src.utils.sting_detection import find_sting, find_all_transitions
+from src.utils.watermark_detection import build_watermark_template
 
 # Fingerprints directory
 FP_DIR = Path(__file__).parent / 'fingerprints'

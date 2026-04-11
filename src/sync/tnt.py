@@ -30,8 +30,8 @@ Usage:
 import sys
 from pathlib import Path
 
-from audio_utils import fmt, get_duration, extract_seg, concat_segments_to_mka
-from sting_detection import find_sting, find_all_transitions
+from src.utils.audio_utils import fmt, get_duration, extract_seg, concat_segments_to_mka
+from src.utils.sting_detection import find_sting, find_all_transitions
 
 # Fallback sting search windows (used when no anchor is provided)
 FALLBACK_MASTER_SEARCH = (600, 1200)   # 10–30 min into web master

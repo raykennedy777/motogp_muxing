@@ -35,9 +35,9 @@ import numpy as np
 from pathlib import Path
 from scipy.io import wavfile
 
-from audio_utils import SR, get_duration, get_audio_stream_count, extract_wav, extract_seg, concat_segments_to_mka
-from sting_detection import find_sting, find_all_transitions
-from canal_watermark import detect_canal_breaks, fmt as wm_fmt
+from src.utils.audio_utils import SR, get_duration, get_audio_stream_count, extract_wav, extract_seg, concat_segments_to_mka
+from src.utils.sting_detection import find_sting, find_all_transitions
+from src.utils.canal_watermark import detect_canal_breaks, fmt as wm_fmt
 
 FP_DIR = Path(__file__).parent / 'fingerprints'
 
@@ -177,7 +177,7 @@ def build_and_concat(canal_file, master_file, canal_stream, ns_stream,
     if not dry_run and Path(canal_file).suffix.lower() in ('.ts', '.mts', '.m2ts'):
         _preextracted_canal_wav = str(tmp_dir / '_canal_preextract.wav')
         print(f'\n  Pre-extracting canal audio (TS source)...')
-        from audio_utils import extract_wav as _exwav
+        from src.utils.audio_utils import extract_wav as _exwav
         _exwav(canal_file, _preextracted_canal_wav, canal_stream,
                sr=48000, channels=2)
         canal_src = _preextracted_canal_wav

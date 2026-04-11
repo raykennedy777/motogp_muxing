@@ -41,9 +41,9 @@ Usage:
 import sys
 from pathlib import Path
 
-from audio_utils import fmt, get_duration, get_audio_stream_count, \
+from src.utils.audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka, load_fp_wav, SR
-from sting_detection import find_sting
+from src.utils.sting_detection import find_sting
 from watermark_detection import build_watermark_template, find_all_breaks_via_watermark
 import subprocess
 import numpy as np

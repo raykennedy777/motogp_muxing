@@ -26,8 +26,8 @@ Usage:
 import sys, argparse
 from pathlib import Path
 
-from audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
-from sting_detection import find_sting
+from src.utils.audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
+from src.utils.sting_detection import find_sting
 
 # Search window for the 65s pre-race sting (start_sec, duration_sec)
 STING_SEARCH_MASTER = (0, 3600)   # first 60 min of master

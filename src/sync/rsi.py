@@ -26,8 +26,8 @@ Requirements: ffmpeg/ffprobe on PATH, numpy, scipy
 import sys, argparse
 from pathlib import Path
 
-from audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
-from sting_detection import find_sting
+from src.utils.audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
+from src.utils.sting_detection import find_sting
 
 FP_DIR = Path(__file__).parent / 'fingerprints'
 

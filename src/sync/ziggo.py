@@ -24,10 +24,10 @@ Usage:
 import sys, subprocess
 from pathlib import Path
 
-from audio_utils import fmt, get_duration, get_audio_stream_count, \
+from src.utils.audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
-from sting_detection import find_all_transitions
-from watermark_detection import (build_watermark_template,
+from src.utils.sting_detection import find_all_transitions
+from src.utils.watermark_detection import (build_watermark_template,
                                   find_all_breaks_via_watermark)
 
 # ── Watermark constants (Ziggo Sport logo, top-right, 1920×1080) ───────────────

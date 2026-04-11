@@ -21,7 +21,7 @@ from pathlib import Path
 from scipy.io import wavfile
 from scipy.signal import fftconvolve
 
-from audio_utils import get_audio_stream_count, extract_wav as _extract_wav
+from src.utils.audio_utils import get_audio_stream_count, extract_wav as _extract_wav
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE       = 8000   # Hz for correlation audio - fast and more than sufficient

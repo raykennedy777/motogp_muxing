@@ -20,8 +20,8 @@ import argparse, gc, json, subprocess, sys
 from pathlib import Path
 import numpy as np
 
-from audio_utils import get_duration, extract_wav
-from sting_detection import CONF_THRESH, find_sting
+from src.utils.audio_utils import get_duration, extract_wav
+from src.utils.sting_detection import CONF_THRESH, find_sting
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MOTO3_STING_SEARCH   = (600, 1200)   # (start_s, dur_s) — 10-30 min

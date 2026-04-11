@@ -406,7 +406,7 @@ def detect_canal_breaks(src, scan_start=0, scan_end=None,
     min_content_sec: merge breaks separated by less than this many seconds of content
     Returns list of (break_start, break_end) tuples.
     """
-    from audio_utils import get_duration
+    from .audio_utils import get_duration
 
     if scan_end is None:
         scan_end = get_duration(src)
