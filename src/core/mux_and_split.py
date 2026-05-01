@@ -20,7 +20,8 @@ import argparse, gc, json, subprocess, sys
 from pathlib import Path
 import numpy as np
 
-from src.utils.audio_utils import get_duration, extract_wav
+from src.utils.audio_utils import (get_duration, extract_wav,
+                                    get_fps, get_video_start_pts)
 from src.utils.sting_detection import CONF_THRESH, find_sting
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -34,10 +35,10 @@ MOTO3_WEBDL_DUR      = 4413.800   # seconds
 MOTO2_WEBDL_DUR      = 4961.000
 MOTOGP_WEBDL_DUR     = 6491.060
 
-FPS                  = 50        # broadcast frame rate
+FPS                  = 50.0      # default; overridden at runtime by probe_master_fps()
 MOTOGP_END_TOLERANCE = 5.0       # cross-check tolerance (seconds)
 
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 # Video frame matching (for Moto2 / MotoGP start refinement)
 VIDEO_ANCHOR_T      = 0.5    # seconds into WEB-DL to sample reference frame
@@ -56,12 +57,12 @@ TRACK_PRIORITY = [
 
 CALENDARS = {
     2026: {
-         1: 'Thailand',        2: 'Brazil',          3: 'USA',           4: 'Qatar',
-         5: 'Spain.Jerez',     6: 'France',           7: 'Spain.Catalunya', 8: 'Italy',
-         9: 'Hungary',        10: 'Czechia',          11: 'Netherlands',  12: 'Germany',
-        13: 'Britain',        14: 'Spain.Aragon',     15: 'SanMarino',    16: 'Austria',
-        17: 'Japan',          18: 'Indonesia',        19: 'Australia',    20: 'Malaysia',
-        21: 'Portugal',       22: 'Spain.Valencia',
+         1: 'Thailand',        2: 'Brazil',           3: 'USA',            4: 'Spain.Jerez',
+         5: 'France',          6: 'Spain.Catalunya',  7: 'Italy',          8: 'Hungary',
+         9: 'Czechia',        10: 'Netherlands',      11: 'Germany',       12: 'Britain',
+        13: 'Spain.Aragon',   14: 'SanMarino',        15: 'Austria',       16: 'Japan',
+        17: 'Indonesia',      18: 'Australia',        19: 'Malaysia',      20: 'Portugal',
+        21: 'Spain.Valencia',
     },
     # 2025: rounds 16-22 confirmed from broadcast files.
     # Rounds 1-15 are approximate — verify and correct for any round you process.
@@ -99,6 +100,13 @@ def get_frame_count(f):
         '-of', 'default=noprint_wrappers=1:nokey=1', str(f),
     ], capture_output=True, text=True, check=True)
     return int(r.stdout.strip())
+
+
+def probe_master_fps(path):
+    """Probe FPS from polsat_master and update the module-level FPS constant."""
+    global FPS
+    FPS = get_fps(path)
+    print(f'  FPS probed from master: {FPS}')
 
 
 # ── Video frame matching ─────────────────────────────────────────────────────
@@ -218,6 +226,15 @@ def detect_split_points(web_master, polsat_master, moto2_webdl, motogp_webdl):
     fp_sting    = str(FP_DIR / 'prerace_sting.wav')
     fp_sting_gp = str(FP_DIR / 'prerace_sting_motogp.wav')
 
+    # Probe actual FPS and video PTS offset from polsat_master.
+    # MKV catchup files can have non-zero stream start_time; frame-count-derived
+    # seek targets must include this offset or the split lands at the wrong point.
+    probe_master_fps(polsat_master)
+    master_pts_offset = get_video_start_pts(polsat_master)
+    if master_pts_offset:
+        print(f'  Video PTS offset: {master_pts_offset:.3f}s '
+              f'(will be added to frame-count anchor)')
+
     # ── Moto3 and Moto2 stings in web master ──
     print('\nLocating pre-race stings in web master (Natural Sounds)...')
     m3_master, _ = find_sting(web_master, fp_sting,
@@ -252,6 +269,9 @@ def detect_split_points(web_master, polsat_master, moto2_webdl, motogp_webdl):
                                         moto2_start, label='Moto2')
 
     # ── MotoGP start: count backwards from end of polsat_master ──
+    # Frame-count gives position relative to the video stream start.  Add the
+    # PTS offset so the seek time is in container-timeline units (what mkvmerge
+    # --split timecodes: expects).
     master_frames = get_frame_count(polsat_master)
     if motogp_webdl:
         motogp_frames = get_frame_count(str(motogp_webdl))
@@ -261,7 +281,7 @@ def detect_split_points(web_master, polsat_master, moto2_webdl, motogp_webdl):
         motogp_dur    = MOTOGP_WEBDL_DUR
 
     motogp_start_frame = master_frames - motogp_frames
-    motogp_start       = motogp_start_frame / FPS
+    motogp_start       = master_pts_offset + motogp_start_frame / FPS
     print(f'\nMotoGP frame-count anchor: '
           f'master={master_frames} frames  webdl={motogp_frames} frames  '
           f'-> start=frame {motogp_start_frame} = {motogp_start:.3f}s '
@@ -390,85 +410,113 @@ def mux_combined(polsat_master, web_master, combined_tracks, output):
     return codec, resolution
 
 
-# ── Phase 3: Frame-accurate splitting ────────────────────────────────────────
+# ── Phase 3: Keyframe-accurate splitting via mkvmerge ────────────────────────
 
-def smart_cut(src, output, t_start, webdl_dur, codec_str, exclude_audio=None):
+def _parse_split_timestamps_ms(stdout):
     """
-    Extract [t_start, t_start + webdl_dur] from src using the smartcut library.
-    smartcut re-encodes only the partial GOPs at cut boundaries; everything
-    else is stream-copied.  codec_str is 'x264' or 'x265' (from mux_combined).
-
-    exclude_audio: optional list of 0-based audio track indices to drop from the
-    output file (e.g. [1, 3] drops TNT and Polsat from a 5-track combined master).
-    smartcut always cuts with all tracks; excluded tracks are stripped afterwards
-    by a fast mkvmerge remux.
+    Parse 'Timestamp used in split decision: HH:MM:SS.NNNNNNNNN' lines from
+    mkvmerge stdout and return a list of timestamps in milliseconds.
     """
-    from fractions import Fraction
-    from smartcut.media_container import MediaContainer
-    from smartcut.cut_video import smart_cut as _sc, VideoSettings
-    from smartcut.media_utils import VideoExportMode, VideoExportQuality
-    from smartcut.misc_data import AudioExportSettings, AudioExportInfo
+    import re
+    timestamps = []
+    for line in stdout.splitlines():
+        m = re.search(r'Timestamp used in split decision:\s+(\d+):(\d+):(\d+)\.(\d+)', line)
+        if m:
+            h, mn, s, ns_str = m.groups()
+            ns = int(ns_str.ljust(9, '0')[:9])
+            total_ms = (int(h) * 3600 + int(mn) * 60 + int(s)) * 1000 + ns // 1_000_000
+            timestamps.append(total_ms)
+    return timestamps
 
-    t_end = t_start + webdl_dur
-    print(f'  smartcut: {t_start:.3f}s - {t_end:.3f}s  ({webdl_dur:.3f}s)')
+
+def split_with_mkvmerge(src, out_dir, moto2_start, motogp_start, exclude_audio=None):
+    """
+    Split src into 3 segments (Moto3 / Moto2 / MotoGP) using mkvmerge --split.
+
+    mkvmerge splits at the nearest keyframe to each timecode, which is
+    frame-accurate enough for broadcast races (keyframe interval ~2s at 50fps).
+    This avoids loading all audio packets into RAM (the smartcut OOM failure path).
+
+    Returns (parts, individual_delays_ms) where:
+      parts: list of (cls, path) for the 3 intermediates
+      individual_delays_ms: dict {cls: delay_ms} — delay to apply to individual
+        MKA tracks when remuxing each split segment.  Non-zero for Moto2/MotoGP
+        because mkvmerge rounds the split to the nearest keyframe, so the
+        intermediate starts slightly later than the intended timecode.  Positive
+        delay shifts audio later to compensate.
+    """
+    t1_ms = round(moto2_start  * 1000)
+    t2_ms = round(motogp_start * 1000)
+    pattern = str(out_dir / '_intermediate_%03d.mkv')
+
+    cmd = ['mkvmerge', '-o', pattern,
+           '--split', f'timecodes:{t1_ms}ms,{t2_ms}ms',
+           str(src)]
 
     exclude_set = set(exclude_audio or [])
-    sc_output   = output.parent / ('_sc_tmp_' + output.name) if exclude_set else output
-
-    container = MediaContainer(str(src))
-    segments  = [(Fraction(t_start), Fraction(t_end))]
-
-    sc_codec  = 'hevc' if codec_str == 'x265' else 'h264'
-    vid_set   = VideoSettings(
-        mode=VideoExportMode.SMARTCUT,
-        quality=VideoExportQuality.NORMAL,
-        codec_override=sc_codec,
-    )
-
-    n_audio  = len(container.audio_tracks)
-    aud_info = AudioExportInfo(
-        output_tracks=[AudioExportSettings(codec='passthru')] * n_audio,
-    )
-
-    exc = _sc(
-        media_container=container,
-        positive_segments=segments,
-        out_path=str(sc_output),
-        audio_export_info=aud_info,
-        video_settings=vid_set,
-    )
-    if exc is not None:
-        raise exc
-
     if exclude_set:
-        # mkvmerge --audio-tracks uses absolute track IDs (as shown by mkvmerge -i),
-        # not 0-based audio-type indices. Query the actual IDs from the file.
-        _, audio_tracks = identify_tracks(sc_output)
+        _, audio_tracks = identify_tracks(src)
         keep_ids = [t['id'] for i, t in enumerate(audio_tracks) if i not in exclude_set]
         excl_ids = [t['id'] for i, t in enumerate(audio_tracks) if i in exclude_set]
         keep_str = ','.join(str(i) for i in keep_ids)
         print(f'  Dropping audio idx {sorted(exclude_set)} (absolute IDs {excl_ids}); '
-              f'keeping absolute IDs {keep_ids} -> {output.name}')
-        subprocess.run(
-            ['mkvmerge', '-o', str(output),
-             '--audio-tracks', keep_str, str(sc_output)],
-            check=True)
-        sc_output.unlink()
+              f'keeping absolute IDs {keep_ids}')
+        cmd = ['mkvmerge', '-o', pattern,
+               '--audio-tracks', keep_str,
+               '--split', f'timecodes:{t1_ms}ms,{t2_ms}ms',
+               str(src)]
 
-    # Fix DefaultDuration: smartcut's partial-GOP re-encoder can write incorrect
-    # fps into the H.264 SPS, causing tools like TMPGenc to misread the frame rate.
-    # mkvpropedit patches the MKV track header without touching the video bitstream.
+    print(f'  mkvmerge split: timecodes {t1_ms}ms, {t2_ms}ms')
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    print(result.stdout, end='')
+
+    # Parse actual split timestamps from mkvmerge output to compute keyframe offsets.
+    # The split lands slightly LATER than the requested timecode (nearest keyframe).
+    # Individual MKAs are aligned to the requested timecode, so the video starts
+    # that many ms LATER than the audio → audio needs a negative sync (trim start).
+    actual_ts = _parse_split_timestamps_ms(result.stdout)
+    # actual_ts[0] = actual Moto2 split; actual_ts[1] = actual MotoGP split
+    moto2_delay_ms  = -(actual_ts[0] - t1_ms) if len(actual_ts) > 0 else 0
+    motogp_delay_ms = -(actual_ts[1] - t2_ms) if len(actual_ts) > 1 else 0
+    if moto2_delay_ms:
+        print(f'  Moto2  keyframe offset: {actual_ts[0] - t1_ms:+d}ms '
+              f'(individual tracks synced by {moto2_delay_ms:+d}ms)')
+    if motogp_delay_ms:
+        print(f'  MotoGP keyframe offset: {actual_ts[1] - t2_ms:+d}ms '
+              f'(individual tracks synced by {motogp_delay_ms:+d}ms)')
+
+    # mkvmerge names outputs _intermediate_001.mkv, _002.mkv, _003.mkv
+    parts = [
+        ('Moto3',  out_dir / '_intermediate_001.mkv'),
+        ('Moto2',  out_dir / '_intermediate_002.mkv'),
+        ('MotoGP', out_dir / '_intermediate_003.mkv'),
+    ]
+
+    # Rename to _intermediate_Moto3.mkv etc. and fix DefaultDuration header
     dur_ns = round(1_000_000_000 / FPS)
-    subprocess.run(
-        ['mkvpropedit', str(output),
-         '--edit', 'track:v1',
-         '--set', f'default-duration={dur_ns}'],
-        check=True)
+    result_parts = []
+    for cls, src_path in parts:
+        dst_path = out_dir / f'_intermediate_{cls}.mkv'
+        src_path.rename(dst_path)
+        subprocess.run(
+            ['mkvpropedit', str(dst_path),
+             '--edit', 'track:v1',
+             '--set', f'default-duration={dur_ns}'],
+            check=True)
+        result_parts.append((cls, dst_path))
+
+    individual_delays_ms = {
+        'Moto3':  0,
+        'Moto2':  moto2_delay_ms,
+        'MotoGP': motogp_delay_ms,
+    }
+    return result_parts, individual_delays_ms
 
 
 # ── Phase 4: Remux split intermediate with individual tracks ──────────────────
 
-def remux_with_individual_tracks(split_file, output, individual_tracks):
+def remux_with_individual_tracks(split_file, output, individual_tracks,
+                                  individual_delay_ms=0):
     """
     Remux a split intermediate file, inserting individual audio tracks
     and reordering all audio by TRACK_PRIORITY.
@@ -476,6 +524,11 @@ def remux_with_individual_tracks(split_file, output, individual_tracks):
     split_file: intermediate MKV from smart_cut (video + combined audio tracks)
     output: final output path
     individual_tracks: list of (path, track_name, language) tuples
+    individual_delay_ms: delay in ms applied to all individual MKA tracks.
+        mkvmerge splits at the nearest keyframe, so the intermediate starts
+        slightly later than the requested timecode.  individual MKAs were
+        generated against the exact timecode, so they need this positive delay
+        to stay in sync with the video.
     """
     vid_tracks, aud_tracks = identify_tracks(split_file)
     if not vid_tracks:
@@ -512,19 +565,22 @@ def remux_with_individual_tracks(split_file, output, individual_tracks):
         if kind == 'split':
             track_order_parts.append(f'0:{t_info["id"]}')
         else:
-            mkv += ['--no-video', '--no-subtitles', '--no-chapters',
-                    '--audio-tracks',  '0',
-                    '--track-name',    f'0:{name}',
-                    '--language',      f'0:{lang}',
-                    '--default-track', '0:no',
-                    str(path)]
+            inp_args = ['--no-video', '--no-subtitles', '--no-chapters',
+                        '--audio-tracks',  '0',
+                        '--track-name',    f'0:{name}',
+                        '--language',      f'0:{lang}',
+                        '--default-track', '0:no']
+            if individual_delay_ms:
+                inp_args += ['--sync', f'0:{individual_delay_ms}']
+            mkv += inp_args + [str(path)]
             track_order_parts.append(f'{new_input_idx}:0')
             new_input_idx += 1
 
     mkv += ['--track-order', ','.join(track_order_parts)]
 
     n_new = sum(1 for k, *_ in all_audio if k == 'new')
-    print(f'  Remuxing with {n_new} individual tracks -> {output.name}')
+    delay_note = f' (sync {individual_delay_ms:+d}ms)' if individual_delay_ms else ''
+    print(f'  Remuxing with {n_new} individual tracks{delay_note} -> {output.name}')
     subprocess.run(mkv, check=True)
 
 
@@ -694,18 +750,16 @@ def main():
     if exclude_audio:
         print(f'\nExcluding audio tracks {exclude_audio} from split output files.')
 
-    intermediates = []
-    for cls, t_start, dur, frames in (
-        ('Moto3',  0.0,          moto3_dur,  moto3_frames),
-        ('Moto2',  moto2_start,  moto2_dur,  moto2_frames),
-        ('MotoGP', motogp_start, motogp_dur, motogp_frames),
-    ):
-        # Intermediate file for smart_cut
-        intermediate = out_dir / f'_intermediate_{cls}.mkv'
-        print(f'\n-- {cls}: t={t_start:.3f}s  {frames} frames')
-        print(f'   -> splitting to intermediate: {intermediate.name}')
-        smart_cut(combined, intermediate, t_start, dur, codec, exclude_audio)
-        intermediates.append((cls, intermediate, frames))
+    print(f'\n-- Splitting combined master with mkvmerge --')
+    split_parts, individual_delays_ms = split_with_mkvmerge(
+        combined, out_dir, moto2_start, motogp_start, exclude_audio)
+
+    frames_by_cls = {
+        'Moto3':  moto3_frames,
+        'Moto2':  moto2_frames,
+        'MotoGP': motogp_frames,
+    }
+    intermediates = [(cls, path, frames_by_cls[cls]) for cls, path in split_parts]
 
     # ── Phase 4: Remux with individual tracks ──
     for cls, intermediate, frames in intermediates:
@@ -719,7 +773,8 @@ def main():
 
         print(f'\n-- {cls}: remux with {len(race_individual)} individual tracks')
         print(f'   -> {out_file.name}')
-        remux_with_individual_tracks(intermediate, out_file, race_individual)
+        remux_with_individual_tracks(intermediate, out_file, race_individual,
+                                     individual_delay_ms=individual_delays_ms.get(cls, 0))
         intermediate.unlink()  # clean up intermediate
 
     # Optionally delete combined master (never delete a user-provided file)
@@ -805,6 +860,21 @@ def _detect_individual_tracks(directory):
                 result['Moto2'].append((f, 'ServusTV', 'deu'))
             elif 'MotoGP' in f.name:
                 result['MotoGP'].append((f, 'ServusTV', 'deu'))
+
+    # Canal+ (per race)
+    for f in all_files:
+        if 'canal' in f.name.lower():
+            if 'moto3' in f.name.lower():
+                result['Moto3'].append((f, 'Canal+', 'fra'))
+            elif 'moto2' in f.name.lower():
+                result['Moto2'].append((f, 'Canal+', 'fra'))
+            elif 'motogp' in f.name.lower():
+                result['MotoGP'].append((f, 'Canal+', 'fra'))
+
+    # RSI (MotoGP)
+    for f in all_files:
+        if 'rsi' in f.name.lower():
+            result['MotoGP'].append((f, 'RSI', 'ita'))
 
     # evgenymotogp / Russian (all races)
     for f in all_files:

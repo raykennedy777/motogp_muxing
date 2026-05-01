@@ -55,7 +55,7 @@ from src.utils.sting_detection import find_all_transitions, find_sting
 from src.utils.watermark_detection import load_watermark_png, find_break_end_via_watermark, \
                                 find_break_start_via_watermark
 
-FP_DIR         = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 STING_PAIR_GAP_SECS = 480  # 8 min — max sting-start gap to form a pair
 MAX_BREAK_SECS      = 420  # 7 min — max break duration for sanity checks
 WM_FALLBACK_SECS    = 60.0 # break-end fallback when watermark search fails
@@ -294,8 +294,9 @@ def main():
         sys.argv.remove('--sting-only')
         print('[sting-only] Skipping PUBBLICITÀ and watermark fallback detection.')
 
-    anchor_source = None
-    anchor_master = None
+    anchor_source       = None
+    anchor_master       = None
+    orphan_break_starts = []
     for arg in list(sys.argv[1:]):
         if arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
@@ -303,10 +304,14 @@ def main():
         elif arg.startswith('--anchor-master='):
             anchor_master = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
+        elif arg.startswith('--orphan-break-starts='):
+            orphan_break_starts = [float(t) for t in arg.split('=', 1)[1].split(',')]
+            sys.argv.remove(arg)
 
     if anchor_source is None or anchor_master is None or len(sys.argv) != 4:
         sys.exit('Usage: sync_sky_it.py [--dry-run] [--sting-only] '
                  '--anchor-source=S --anchor-master=S '
+                 '[--orphan-break-starts=T1,T2,...] '
                  '<sky_it_file> <master.mkv> <output_dir>')
 
     sky_file, master_file, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -386,7 +391,7 @@ def main():
 
         if pubb_template is not None and mgp_template is not None:
             pubb_used_times = set()
-            for t_sting, sting_conf, clip_dur in orphaned_stings:
+            for orphan_idx, (t_sting, sting_conf, clip_dur) in enumerate(orphaned_stings):
                 sting_end = t_sting + clip_dur
 
                 print(f'\n  Checking role of orphaned sting at {fmt(t_sting)} '
@@ -465,7 +470,12 @@ def main():
                         # to find the break end.
                         print(f'  No PUBBLICITÀ in look-back either; treating as LEAD-IN, '
                               f'searching for MGP watermark return...')
-                        break_start = t_sting
+                        if orphan_idx < len(orphan_break_starts):
+                            break_start = orphan_break_starts[orphan_idx]
+                            print(f'  [override] break_start = {fmt(break_start)} '
+                                  f'(from --orphan-break-starts)')
+                        else:
+                            break_start = t_sting
                         wm_end, found = find_break_end_via_watermark(
                             sky_file, t_sting, clip_dur, mgp_template,
                             SKY_MGP_WM_X, SKY_MGP_WM_Y, SKY_MGP_WM_W, SKY_MGP_WM_H,

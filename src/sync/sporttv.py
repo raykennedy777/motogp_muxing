@@ -68,7 +68,7 @@ WM_THRESH           = 0.44  # Pearson correlation threshold
 WM_FPS              = 2     # frames per second to sample during break-end scan
 
 # Fingerprints directory (alongside this script)
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 
 # ── Show-start and break-end detection ────────────────────────────────────────
@@ -319,15 +319,19 @@ def main():
         sys.argv.remove('--dry-run')
         print('[DRY RUN] Detection and segment planning only — no audio will be encoded.')
 
-    moto3_override = None
-    for arg in sys.argv[1:]:
-        if arg.startswith('--moto3-time='):
+    offset_override = None
+    moto3_override  = None
+    for arg in list(sys.argv[1:]):
+        if arg.startswith('--offset='):
+            offset_override = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--moto3-time='):
             moto3_override = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
-            break
 
     if len(sys.argv) != 4:
-        sys.exit('Usage: sync_sporttv.py [--dry-run] [--moto3-time=<seconds>] '
+        sys.exit('Usage: sync_sporttv.py [--dry-run] '
+                 '[--offset=S | --moto3-time=<seconds>] '
                  '<sporttv_file> <web_master.mkv> <output_dir>')
 
     sporttv_file, web_master, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -350,59 +354,68 @@ def main():
     print(f'Sport TV: {d_sporttv:.1f}s ({d_sporttv/3600:.2f}h)  |  '
           f'Web master: {d_web:.1f}s ({d_web/3600:.2f}h)')
 
-    # ── Find pre-race stings in web master (Natural Sounds track) ──
-    print('\nLocating pre-race stings in web master...')
-    m3_master, _ = find_sting(web_master, fp_sting,
-                               *MOTO3_STING_SEARCH, stream_spec='0:a:1',
-                               label='  Moto3 sting (master)')
-    m2_master, _ = find_sting(web_master, fp_sting,
-                               m3_master + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN,
-                               STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
-                               label='  Moto2 sting (master)')
-    mgp_master, _ = find_sting(web_master, fp_sting_gp,
-                                m2_master + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN,
-                                STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
-                                label='  MotoGP sting (master)')
-
-    # ── Find opening preshow intro sting (done first to gate Moto3 search) ──
+    # ── Find opening preshow intro sting (always runs — gates Moto3 search) ──
     print('\nLocating opening preshow intro sting...')
     show_start_sporttv, _ = find_show_start(sporttv_file, fp_preshow)
 
-    # ── Find Moto3 sting in Sport TV (sync anchor) ──
-    print('\nSearching for Moto3 pre-race sting in Sport TV...')
-    if moto3_override is not None:
-        m3_sporttv, m3_conf = moto3_override, 1.0
-        print(f'  Moto3 sting (Sport TV): {m3_sporttv:.3f}s  [manual override]')
+    m3_sporttv = None  # set below unless --offset bypasses detection
+
+    if offset_override is not None:
+        offset = offset_override
+        print(f'\nManual offset: {offset:.3f}s  (master_time = sporttv_time - {offset:.3f})')
+        if moto3_override is not None:
+            m3_sporttv = moto3_override
+            print(f'  Moto3 sting (Sport TV): {m3_sporttv:.3f}s  [manual override]')
     else:
-        if show_start_sporttv is not None:
-            m3_search_start = show_start_sporttv + 60
-            m3_search_dur   = SPORTTV_MOTO3_SEARCH[1]
-            print(f'  (Searching from {m3_search_start:.1f}s, after preshow end + 60s)')
+        # ── Find pre-race stings in web master (Natural Sounds track) ──
+        print('\nLocating pre-race stings in web master...')
+        m3_master, _ = find_sting(web_master, fp_sting,
+                                   *MOTO3_STING_SEARCH, stream_spec='0:a:1',
+                                   label='  Moto3 sting (master)')
+        m2_master, _ = find_sting(web_master, fp_sting,
+                                   m3_master + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN,
+                                   STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
+                                   label='  Moto2 sting (master)')
+        mgp_master, _ = find_sting(web_master, fp_sting_gp,
+                                    m2_master + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN,
+                                    STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
+                                    label='  MotoGP sting (master)')
+
+        # ── Find Moto3 sting in Sport TV (sync anchor) ──
+        print('\nSearching for Moto3 pre-race sting in Sport TV...')
+        if moto3_override is not None:
+            m3_sporttv, m3_conf = moto3_override, 1.0
+            print(f'  Moto3 sting (Sport TV): {m3_sporttv:.3f}s  [manual override]')
         else:
-            m3_search_start, m3_search_dur = SPORTTV_MOTO3_SEARCH
-        m3_sporttv, m3_conf = find_sting(sporttv_file, fp_sting,
-                                          m3_search_start, m3_search_dur,
-                                          label='  Moto3 sting (Sport TV)')
-        if m3_conf < 0.1:
-            sys.exit('ERROR: Could not find Moto3 pre-race sting in Sport TV. '
-                     'Check fingerprint or search window.')
+            if show_start_sporttv is not None:
+                m3_search_start = show_start_sporttv + 60
+                m3_search_dur   = SPORTTV_MOTO3_SEARCH[1]
+                print(f'  (Searching from {m3_search_start:.1f}s, after preshow end + 60s)')
+            else:
+                m3_search_start, m3_search_dur = SPORTTV_MOTO3_SEARCH
+            m3_sporttv, m3_conf = find_sting(sporttv_file, fp_sting,
+                                              m3_search_start, m3_search_dur,
+                                              label='  Moto3 sting (Sport TV)')
+            if m3_conf < 0.1:
+                sys.exit('ERROR: Could not find Moto3 pre-race sting in Sport TV. '
+                         'Check fingerprint or search window.')
 
-    offset = m3_sporttv - m3_master
-    print(f'  Sport TV offset: {offset:.3f}s  '
-          f'(master_time = sporttv_time - {offset:.3f})')
+        offset = m3_sporttv - m3_master
+        print(f'  Sport TV offset: {offset:.3f}s  '
+              f'(master_time = sporttv_time - {offset:.3f})')
 
-    # ── Find Moto2 and MotoGP stings in Sport TV (informational) ──
-    print('\nSearching for Moto2/MotoGP stings in Sport TV (informational)...')
-    m2_sporttv, _ = find_sting(sporttv_file, fp_sting,
-                                max(0, m3_sporttv + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN),
-                                STING_SEARCH_MARGIN * 2,
-                                label='  Moto2 sting (Sport TV)')
-    mgp_sporttv, mgp_conf = find_sting(sporttv_file, fp_sting_gp,
-                                        max(0, m2_sporttv + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN),
-                                        STING_SEARCH_MARGIN * 2,
-                                        label='  MotoGP sting (Sport TV)')
-    print(f'  Moto2 drift:  {m2_sporttv - (m3_sporttv + MOTO3_TO_MOTO2_SECS):+.1f}s')
-    print(f'  MotoGP drift: {mgp_sporttv - (m2_sporttv + MOTO2_TO_MOTOGP_SECS):+.1f}s')
+        # ── Find Moto2 and MotoGP stings in Sport TV (informational) ──
+        print('\nSearching for Moto2/MotoGP stings in Sport TV (informational)...')
+        m2_sporttv, _ = find_sting(sporttv_file, fp_sting,
+                                    max(0, m3_sporttv + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN),
+                                    STING_SEARCH_MARGIN * 2,
+                                    label='  Moto2 sting (Sport TV)')
+        mgp_sporttv, mgp_conf = find_sting(sporttv_file, fp_sting_gp,
+                                            max(0, m2_sporttv + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN),
+                                            STING_SEARCH_MARGIN * 2,
+                                            label='  MotoGP sting (Sport TV)')
+        print(f'  Moto2 drift:  {m2_sporttv - (m3_sporttv + MOTO3_TO_MOTO2_SECS):+.1f}s')
+        print(f'  MotoGP drift: {mgp_sporttv - (m2_sporttv + MOTO2_TO_MOTOGP_SECS):+.1f}s')
 
     if show_start_sporttv is None:
         show_start_sporttv = offset   # mtime(offset) = 0; NS section will be zero length
@@ -410,19 +423,24 @@ def main():
           f'= master {show_start_sporttv - offset:.3f}s')
 
     # ── Build watermark template ──
+    # Requires m3_sporttv as a reference point; disabled when --offset is used
+    # without --moto3-time.
     print('\nBuilding watermark template...')
     wm_template = None
-    try:
-        wm_ref = m3_sporttv + 300   # 5 min into Moto3 — confirmed live coverage
-        wm_template = build_watermark_template(
-            sporttv_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H,
-            tmp_suffix='_sporttv')
-        if wm_template is not None:
-            print(f'  Template at {wm_ref:.0f}s  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
-        else:
-            print('  Watermark detection disabled (template extraction failed).')
-    except Exception as e:
-        print(f'  Watermark detection disabled: {e}')
+    if m3_sporttv is None:
+        print('  Watermark disabled: provide --moto3-time with --offset to enable.')
+    else:
+        try:
+            wm_ref = m3_sporttv + 300   # 5 min into Moto3 — confirmed live coverage
+            wm_template = build_watermark_template(
+                sporttv_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H,
+                tmp_suffix='_sporttv')
+            if wm_template is not None:
+                print(f'  Template at {wm_ref:.0f}s  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
+            else:
+                print('  Watermark detection disabled (template extraction failed).')
+        except Exception as e:
+            print(f'  Watermark detection disabled: {e}')
 
     # ── Detect ad breaks ──
     # prerace_sting_motogp is included as a return sting: if it appears at the end of

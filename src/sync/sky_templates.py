@@ -19,7 +19,7 @@ from pathlib import Path
 
 from watermark_detection import build_watermark_template, get_video_dimensions
 
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 # ── Sky Italia watermark regions (1280×720) ───────────────────────────────────
 

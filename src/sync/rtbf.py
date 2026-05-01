@@ -32,7 +32,7 @@ from src.utils.sting_detection import find_sting, find_all_transitions
 from src.utils.watermark_detection import build_watermark_template
 
 # Fingerprints directory
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 # RTBF FPS
 RTBF_FPS = 50

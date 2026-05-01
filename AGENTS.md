@@ -133,11 +133,6 @@ All fingerprint WAV/PNG/MKA clips live in `fingerprints/`.
 |---|---|---|
 | `canal_opening.wav` | `canal.py` | Canal+ post-break opening (10s) |
 | `canal_grid_ending.wav` | `canal.py` | Canal+ grid/pre-race outro (27s) |
-| `canal_moto2_grid_ending.wav` | `canal.py` | Shorter Canal+ grid outro for Moto2 (20s) |
-| `canal_moto3_sting.wav` | `canal.py` | Canal+ Moto3 sting (17s) |
-| `canal_m3m2_opening.wav` | `canal.py` | Canal+ Moto3/Moto2 opening |
-| `canal_sprint_podium.wav` | `canal.py` | Canal+ sprint podium anchor (20s) |
-| `canal_motogp_anthem.wav` | `canal.py` | Canal+ MotoGP national anthem anchor (34s) |
 | `canal_zarco_ad.wav` | `canal.py` | Canal+ Zarco ad watermark |
 | `mgp_logo_wm_ref.png` | `canal.py`, `watermark_detection_canal.py` | MGP logo watermark template |
 

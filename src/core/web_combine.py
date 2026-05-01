@@ -25,8 +25,8 @@ from src.utils.audio_utils import get_audio_stream_count, extract_wav as _extrac
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE       = 8000   # Hz for correlation audio - fast and more than sufficient
-NEEDLE_SECS       = 120    # seconds of needle for Moto2 search (sting + unique race audio)
-MOTO2_SEARCH_SECS = 600    # search window after Moto3 end; gap1 is typically ~3 min
+NEEDLE_SECS       = 30     # seconds of needle for Moto2 search (sting is 18s; 30s is sufficient)
+MOTO2_SEARCH_SECS = 400    # search window after Moto3 end; gap1 is typically ~3 min
 
 
 # ── ffprobe helpers ───────────────────────────────────────────────────────────

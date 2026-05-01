@@ -34,7 +34,7 @@ STING_SEARCH_MASTER = (0, 3600)   # first 60 min of master
 STING_SEARCH_SRC    = (0, 3600)   # first 60 min of source (covers all RTS files)
 
 # Fingerprints directory (alongside this script)
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 
 # ── Segment building and concatenation ────────────────────────────────────────
@@ -125,6 +125,9 @@ def main():
                         help='Opening sting duration to replace with NS (seconds).')
     parser.add_argument('--trim-end',   type=float, default=0.0, metavar='S',
                         help='Closing sting duration to replace with NS (seconds).')
+    parser.add_argument('--offset', type=float, default=None, metavar='S',
+                        help='Direct sync offset (master_time = src_time + offset). '
+                             'Skips all sting detection.')
     parser.add_argument('--src-sting-time', type=float, default=None, metavar='S',
                         help='Override: known sting/anchor time in source (seconds). Skips detection.')
     parser.add_argument('--master-sting-time', type=float, default=None, metavar='S',
@@ -157,33 +160,39 @@ def main():
     ns_stream = f'0:a:{n_audio - 1}'
     print(f'Master audio tracks: {n_audio}  ->  Natural Sounds on {ns_stream}')
 
-    # ── Find pre-race sting in master ──
-    if args.master_sting_time is not None:
-        master_sting = args.master_sting_time
-        print(f'\nMaster anchor: {master_sting:.3f}s (manual override)')
+    # ── Sync anchor ──
+    if args.offset is not None:
+        src_sting    = 0.0
+        master_sting = args.offset
+        print(f'\nManual offset: {args.offset:.3f}s  (master_time = rts_time + {args.offset:.3f})')
     else:
-        print('\nLocating 65s sting in master...')
-        master_sting, master_conf = find_sting(
-            args.master_file, fp_sting,
-            *STING_SEARCH_MASTER, stream_spec=ns_stream,
-            label='  Sting (master)')
-        if master_conf < 0.1:
-            sys.exit('ERROR: Could not find pre-race sting in master. '
-                     'Check fingerprint or STING_SEARCH_MASTER window.')
+        # ── Find pre-race sting in master ──
+        if args.master_sting_time is not None:
+            master_sting = args.master_sting_time
+            print(f'\nMaster anchor: {master_sting:.3f}s (manual override)')
+        else:
+            print('\nLocating 65s sting in master...')
+            master_sting, master_conf = find_sting(
+                args.master_file, fp_sting,
+                *STING_SEARCH_MASTER, stream_spec=ns_stream,
+                label='  Sting (master)')
+            if master_conf < 0.1:
+                sys.exit('ERROR: Could not find pre-race sting in master. '
+                         'Check fingerprint or STING_SEARCH_MASTER window.')
 
-    # ── Find pre-race sting in RTS source ──
-    if args.src_sting_time is not None:
-        src_sting = args.src_sting_time
-        print(f'Source anchor: {src_sting:.3f}s (manual override)')
-    else:
-        print('\nLocating 65s sting in RTS source...')
-        src_sting, src_conf = find_sting(
-            args.rts_file, fp_sting,
-            *STING_SEARCH_SRC, stream_spec='0:a:0',
-            label='  Sting (RTS)')
-        if src_conf < 0.1:
-            sys.exit('ERROR: Could not find pre-race sting in RTS file. '
-                     'Check fingerprint or STING_SEARCH_SRC window.')
+        # ── Find pre-race sting in RTS source ──
+        if args.src_sting_time is not None:
+            src_sting = args.src_sting_time
+            print(f'Source anchor: {src_sting:.3f}s (manual override)')
+        else:
+            print('\nLocating 65s sting in RTS source...')
+            src_sting, src_conf = find_sting(
+                args.rts_file, fp_sting,
+                *STING_SEARCH_SRC, stream_spec='0:a:0',
+                label='  Sting (RTS)')
+            if src_conf < 0.1:
+                sys.exit('ERROR: Could not find pre-race sting in RTS file. '
+                         'Check fingerprint or STING_SEARCH_SRC window.')
 
     # ── Build output ──
     print('\nBuilding output segments...')

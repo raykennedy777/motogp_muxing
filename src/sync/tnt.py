@@ -43,7 +43,7 @@ STING_PRE_ANCHOR_SECS = 300    # generous window — covers 65s MotoGP sting + g
 MAX_BREAK_SECS = 420  # 7 minutes - discard pairings longer than this
 
 # Fingerprints directory (alongside this script)
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 
 def pair_breaks(events):
@@ -173,6 +173,7 @@ def main():
     if motogp_mode:
         sys.argv.remove('--motogp')
 
+    offset_override    = None
     anchor_source   = None
     anchor_master   = None
     sting_tnt_override = None
@@ -180,7 +181,10 @@ def main():
     manual_breaks   = []
     file_label      = ''
     for arg in list(sys.argv[1:]):
-        if arg.startswith('--anchor-source='):
+        if arg.startswith('--offset='):
+            offset_override = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
         elif arg.startswith('--anchor-master='):
@@ -202,7 +206,7 @@ def main():
 
     if len(sys.argv) != 4:
         sys.exit('Usage: sync_tnt.py [--dry-run] [--motogp] '
-                 '[--anchor-source=S --anchor-master=S] '
+                 '[--offset=S | --anchor-source=S --anchor-master=S] '
                  '[--ns-track=STREAM] [--sting-tnt=S] [--break=S:E] [--label=LABEL] '
                  '<tnt_file> <web_master.mkv> <output_dir>')
 
@@ -235,7 +239,10 @@ def main():
     print(f'TNT: {fmt(d_tnt)}  |  Web master: {fmt(d_web)}')
 
     # ── Sync offset ──
-    if anchor_source is not None and anchor_master is not None:
+    if offset_override is not None:
+        offset = offset_override
+        print(f'\nManual offset: {offset:.3f}s  (master_time = tnt_time - {offset:.3f})')
+    elif anchor_source is not None and anchor_master is not None:
         offset = anchor_source - anchor_master
         print(f'\nAnchor: TNT {fmt(anchor_source)} = master {fmt(anchor_master)}')
         print(f'  Offset: {offset:.3f}s  (master_time = tnt_time - {offset:.3f})')

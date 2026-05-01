@@ -28,7 +28,7 @@ from pathlib import Path
 
 from src.utils.audio_utils import SR, fmt, get_duration, extract_wav, extract_seg, load_fp_wav, _peak, concat_segments_to_mka
 from src.utils.sting_detection import CONF_THRESH, find_sting, find_all_transitions
-from watermark_detection import build_watermark_template, find_break_end_via_watermark
+from src.utils.watermark_detection import build_watermark_template, find_break_end_via_watermark
 
 # Search window for Moto3 sting in web master (absolute)
 MOTO3_STING_SEARCH  = (600,  1200)  # 10–30 min into web master
@@ -66,7 +66,7 @@ WATERMARK_FPS       = 2     # frames per second to sample during break-end scan
 DAZN_WM_LAG_SECS    = -58.3
 
 # Fingerprints directory (alongside this script)
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 
 # ── DAZN break detection ──────────────────────────────────────────────────────
@@ -279,20 +279,32 @@ def main():
         sys.argv.remove('--dry-run')
         print('[DRY RUN] Detection and segment planning only — no audio will be encoded.')
 
-    mgp_sting_override = None
-    m3_dazn_override   = None
-    sprint_mode        = '--sprint' in sys.argv
-    anchor_source      = None
-    anchor_master      = None
-    program_start      = None
+    mgp_sting_override  = None
+    offset_override     = None
+    m3_dazn_override    = None
+    end_sting_override  = None
+    m3_master_override  = None
+    sprint_mode         = '--sprint' in sys.argv
+    anchor_source       = None
+    anchor_master       = None
+    program_start       = None
     if sprint_mode:
         sys.argv.remove('--sprint')
     for arg in list(sys.argv[1:]):
-        if arg.startswith('--mgp-sting-dazn='):
+        if arg.startswith('--offset='):
+            offset_override = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--mgp-sting-dazn='):
             mgp_sting_override = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
         elif arg.startswith('--m3-dazn='):
             m3_dazn_override = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--m3-master='):
+            m3_master_override = float(arg.split('=', 1)[1])
+            sys.argv.remove(arg)
+        elif arg.startswith('--end-sting-dazn='):
+            end_sting_override = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
         elif arg.startswith('--anchor-source='):
             anchor_source = float(arg.split('=', 1)[1])
@@ -303,11 +315,12 @@ def main():
         elif arg.startswith('--program-start='):
             program_start = float(arg.split('=', 1)[1])
             sys.argv.remove(arg)
-    if sprint_mode and (anchor_source is None or anchor_master is None):
-        sys.exit('ERROR: --sprint requires --anchor-source=S and --anchor-master=S')
+    if sprint_mode and offset_override is None and (anchor_source is None or anchor_master is None):
+        sys.exit('ERROR: --sprint requires --offset=S or both --anchor-source=S and --anchor-master=S')
 
     if len(sys.argv) != 4:
         sys.exit('Usage: sync_dazn.py [--dry-run] [--mgp-sting-dazn=S] [--m3-dazn=S] '
+                 '[--end-sting-dazn=S] '
                  '[--sprint --anchor-source=S --anchor-master=S [--program-start=S]] '
                  '<dazn_file> <web_master.mkv> <output_dir>')
 
@@ -348,24 +361,34 @@ def main():
           f'Web master: {d_web:.1f}s ({d_web/3600:.2f}h)')
 
     if sprint_mode:
-        # ── Sprint mode: use frame-based anchor directly ──
-        offset = anchor_source - anchor_master   # dazn_time - offset = master_time
-        print(f'\nSprint mode — anchor: DAZN {fmt(anchor_source)} = master {fmt(anchor_master)}')
-        print(f'  Offset: {offset:.3f}s  (master_time = dazn_time - {offset:.3f})')
+        # ── Sprint mode ──
+        if offset_override is not None:
+            offset = offset_override
+            print(f'\nSprint mode — manual offset: {offset:.3f}s  '
+                  f'(master_time = dazn_time - {offset:.3f})')
+        else:
+            offset = anchor_source - anchor_master   # dazn_time - offset = master_time
+            print(f'\nSprint mode — anchor: DAZN {fmt(anchor_source)} = master {fmt(anchor_master)}')
+            print(f'  Offset: {offset:.3f}s  (master_time = dazn_time - {offset:.3f})')
 
-        # Build watermark template from anchor time (race start = confirmed live)
+        # Build watermark template from anchor time (race start = confirmed live).
+        # Requires anchor_source; disabled when only --offset is provided.
         print('\nBuilding watermark template...')
         wm_template = None
-        try:
-            wm_ref = anchor_source + 300   # 5 min after race start
-            wm_template = build_watermark_template(
-                dazn_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
-            if wm_template is not None:
-                print(f'  Template at DAZN {fmt(wm_ref)}  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
-            else:
-                print('  Watermark detection disabled (template extraction failed).')
-        except Exception as e:
-            print(f'  Watermark detection disabled: {e}')
+        wm_anchor = anchor_source if anchor_source is not None else None
+        if wm_anchor is None:
+            print('  Watermark disabled: provide --anchor-source with --offset to enable.')
+        else:
+            try:
+                wm_ref = wm_anchor + 300   # 5 min after race start
+                wm_template = build_watermark_template(
+                    dazn_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
+                if wm_template is not None:
+                    print(f'  Template at DAZN {fmt(wm_ref)}  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
+                else:
+                    print('  Watermark detection disabled (template extraction failed).')
+            except Exception as e:
+                print(f'  Watermark detection disabled: {e}')
 
         # Detect breaks (same method as Sunday)
         print('\nScanning DAZN for ad break lead-ins...')
@@ -395,17 +418,17 @@ def main():
             print(f'    Break {i+1}: DAZN {fmt(s)}-{fmt(e)}  '
                   f'dur={e-s:.1f}s  master {fmt(ms)}-{fmt(me)}')
 
-        # Show start: first break ending before anchor (= show intro break)
+        # Show start: --program-start takes priority; fall back to first pre-anchor break
         pre_breaks = [(s, e) for s, e in breaks if e < anchor_source]
-        if pre_breaks:
+        if program_start is not None:
+            pre_break_end_dazn = program_start
+            print(f'\nUsing --program-start: DAZN {fmt(program_start)} '
+                  f'= master {fmt(program_start - offset)}')
+        elif pre_breaks:
             pre_break_end_dazn = pre_breaks[0][1]
             print(f'\nShow-start break: DAZN {fmt(pre_breaks[0][0])}-{fmt(pre_break_end_dazn)}')
             print(f'  DAZN commentary starts at DAZN {fmt(pre_break_end_dazn)} '
                   f'= master {fmt(pre_break_end_dazn - offset)}')
-        elif program_start is not None:
-            pre_break_end_dazn = program_start
-            print(f'\nNo pre-anchor break found; using --program-start: '
-                  f'DAZN {fmt(program_start)} = master {fmt(program_start - offset)}')
         else:
             pre_break_end_dazn = offset   # start at master t=0
             print(f'\nNo pre-anchor break found; DAZN starts concurrently with master.')
@@ -414,47 +437,58 @@ def main():
         end_sting_dazn = min(offset + d_web, d_dazn)
 
     else:
-        # ── Sunday mode: full multi-race detection ──
-        print('\nLocating pre-race stings in web master...')
-        m3_master, _ = find_sting(web_master, fp_sting,
-                                   *MOTO3_STING_SEARCH, stream_spec='0:a:1',
-                                   label='  Moto3 sting (master)')
-        m2_master, _ = find_sting(web_master, fp_sting,
-                                   m3_master + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN,
-                                   STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
-                                   label='  Moto2 sting (master)')
-        mgp_master, _ = find_sting(web_master, fp_sting_gp,
-                                    m2_master + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN,
-                                    STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
-                                    label='  MotoGP sting (master)')
+        # ── Sunday mode ──
+        m3_dazn = None  # set below unless --offset bypasses detection
 
-        print('\nSearching for Moto3 pre-race sting in DAZN...')
-        if m3_dazn_override is not None:
-            m3_dazn, m3_conf = m3_dazn_override, 1.0
-            print(f'  Moto3 sting (DAZN): {m3_dazn:.3f}s  [manual override]')
+        if offset_override is not None:
+            offset = offset_override
+            print(f'\nManual offset: {offset:.3f}s  (master_time = dazn_time - {offset:.3f})')
         else:
-            m3_dazn, m3_conf = find_sting(dazn_file, fp_sting,
-                                           *DAZN_MOTO3_SEARCH,
-                                           label='  Moto3 sting (DAZN)')
-            if m3_conf < 0.1:
-                sys.exit('ERROR: Could not find Moto3 pre-race sting in DAZN. '
-                         'Check fingerprint or search window.')
+            print('\nLocating pre-race stings in web master...')
+            if m3_master_override is not None:
+                m3_master = m3_master_override
+                print(f'  Moto3 sting (master): {m3_master:.3f}s  [manual override]')
+            else:
+                m3_master, _ = find_sting(web_master, fp_sting,
+                                           *MOTO3_STING_SEARCH, stream_spec='0:a:1',
+                                           label='  Moto3 sting (master)')
+            m2_master, _ = find_sting(web_master, fp_sting,
+                                       m3_master + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN,
+                                       STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
+                                       label='  Moto2 sting (master)')
+            mgp_master, _ = find_sting(web_master, fp_sting_gp,
+                                        m2_master + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN,
+                                        STING_SEARCH_MARGIN * 2, stream_spec='0:a:1',
+                                        label='  MotoGP sting (master)')
 
-        offset = m3_dazn - m3_master
-        print(f'  DAZN offset: {offset:.3f}s  '
-              f'(master_time = dazn_time - {offset:.3f})')
+            print('\nSearching for Moto3 pre-race sting in DAZN...')
+            if m3_dazn_override is not None:
+                m3_dazn, m3_conf = m3_dazn_override, 1.0
+                print(f'  Moto3 sting (DAZN): {m3_dazn:.3f}s  [manual override]')
+            else:
+                m3_dazn, m3_conf = find_sting(dazn_file, fp_sting,
+                                               *DAZN_MOTO3_SEARCH,
+                                               label='  Moto3 sting (DAZN)')
+                if m3_conf < 0.1:
+                    sys.exit('ERROR: Could not find Moto3 pre-race sting in DAZN. '
+                             'Check fingerprint or search window.')
 
-        print('\nSearching for Moto2/MotoGP stings in DAZN (informational)...')
-        m2_dazn, _ = find_sting(dazn_file, fp_sting,
-                                  max(0, m3_dazn + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN),
-                                  STING_SEARCH_MARGIN * 2,
-                                  label='  Moto2 sting (DAZN)')
-        mgp_dazn_info, _ = find_sting(dazn_file, fp_sting,
-                                       max(0, m2_dazn + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN),
-                                       STING_SEARCH_MARGIN * 2,
-                                       label='  MotoGP sting (DAZN, informational)')
-        print(f'  Moto2 drift:  {m2_dazn - (m3_dazn + MOTO3_TO_MOTO2_SECS):+.1f}s')
-        print(f'  MotoGP drift: {mgp_dazn_info - (m2_dazn + MOTO2_TO_MOTOGP_SECS):+.1f}s')
+            offset = m3_dazn - m3_master
+            print(f'  DAZN offset: {offset:.3f}s  '
+                  f'(master_time = dazn_time - {offset:.3f})')
+
+            # Informational — depend on m3_dazn so only run when it was detected
+            print('\nSearching for Moto2/MotoGP stings in DAZN (informational)...')
+            m2_dazn, _ = find_sting(dazn_file, fp_sting,
+                                      max(0, m3_dazn + MOTO3_TO_MOTO2_SECS - STING_SEARCH_MARGIN),
+                                      STING_SEARCH_MARGIN * 2,
+                                      label='  Moto2 sting (DAZN)')
+            mgp_dazn_info, _ = find_sting(dazn_file, fp_sting,
+                                           max(0, m2_dazn + MOTO2_TO_MOTOGP_SECS - STING_SEARCH_MARGIN),
+                                           STING_SEARCH_MARGIN * 2,
+                                           label='  MotoGP sting (DAZN, informational)')
+            print(f'  Moto2 drift:  {m2_dazn - (m3_dazn + MOTO3_TO_MOTO2_SECS):+.1f}s')
+            print(f'  MotoGP drift: {mgp_dazn_info - (m2_dazn + MOTO2_TO_MOTOGP_SECS):+.1f}s')
 
         print('\nSearching for 65s MotoGP intro sting in DAZN...')
         if mgp_sting_override is not None:
@@ -471,27 +505,37 @@ def main():
                       'Sting extension will be skipped.')
 
         print('\nSearching for end program sting in DAZN...')
-        end_sting_dazn, end_conf = find_sting(
-            dazn_file, fp_end_sting,
-            *DAZN_END_STING_SEARCH,
-            label='  End program sting (DAZN)')
-        if end_conf < CONF_THRESH:
-            print('  WARNING: End program sting not found; '
-                  'DAZN section will run to master end (no NS tail).')
-            end_sting_dazn = offset + d_web
+        if end_sting_override is not None:
+            end_sting_dazn = end_sting_override
+            print(f'  End program sting (DAZN): {end_sting_dazn:.3f}s  [manual override]')
+        else:
+            end_sting_dazn, end_conf = find_sting(
+                dazn_file, fp_end_sting,
+                *DAZN_END_STING_SEARCH,
+                label='  End program sting (DAZN)')
+            if end_conf < CONF_THRESH:
+                print('  WARNING: End program sting not found; '
+                      'DAZN section will run to master end (no NS tail).')
+                end_sting_dazn = offset + d_web
 
+        # Watermark template needs m3_dazn as a reference point; disabled with --offset
+        # unless --m3-dazn is also supplied.
         print('\nBuilding watermark template...')
         wm_template = None
-        try:
-            wm_ref = m3_dazn + 300
-            wm_template = build_watermark_template(
-                dazn_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
-            if wm_template is not None:
-                print(f'  Template at {wm_ref:.0f}s  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
-            else:
-                print('  Watermark detection disabled (template extraction failed).')
-        except Exception as e:
-            print(f'  Watermark detection disabled: {e}')
+        if m3_dazn is None:
+            print('  Watermark disabled: no m3_dazn anchor with --offset. '
+                  'Provide --m3-dazn=S to enable.')
+        else:
+            try:
+                wm_ref = m3_dazn + 300
+                wm_template = build_watermark_template(
+                    dazn_file, wm_ref, WM_X, WM_Y, WM_W, WM_H, WM_OUT_W, WM_OUT_H)
+                if wm_template is not None:
+                    print(f'  Template at {wm_ref:.0f}s  crop={WM_W}x{WM_H}@({WM_X},{WM_Y})')
+                else:
+                    print('  Watermark detection disabled (template extraction failed).')
+            except Exception as e:
+                print(f'  Watermark detection disabled: {e}')
 
         print('\nScanning DAZN for ad break lead-ins (watermark fallback active for all breaks)...')
         breaks = detect_breaks_dazn(dazn_file, fp_list, fp_showintro_list, showintro_dur,

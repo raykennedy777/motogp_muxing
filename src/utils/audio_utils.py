@@ -41,6 +41,60 @@ def get_duration(f):
     return float(r.stdout.strip())
 
 
+def get_fps(path):
+    """Probe video stream frame rate as a float (e.g. 50.0)."""
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+         '-show_entries', 'stream=r_frame_rate',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+        capture_output=True, text=True, check=True)
+    val = r.stdout.strip()
+    if '/' in val:
+        num, den = val.split('/')
+        return float(num) / float(den)
+    return float(val)
+
+
+def get_video_start_pts(path):
+    """Return video stream start_time in seconds (container PTS offset), or 0.0.
+
+    MKV catchup recordings can have a non-zero video stream_start.  Frame N at
+    fps F starts at container time  start_pts + N/F  — seek targets must include
+    this offset or the cut will land in the wrong place.
+    """
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+         '-show_entries', 'stream=start_time',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+        capture_output=True, text=True, check=True)
+    lines = [l for l in r.stdout.strip().splitlines()
+             if l.strip() and l.strip() != 'N/A']
+    try:
+        return float(lines[0]) if lines else 0.0
+    except ValueError:
+        return 0.0
+
+
+def get_audio_start_time(path, stream='a:0'):
+    """Return audio stream start_time in seconds, or 0.0.
+
+    If this differs from get_video_start_pts(), the file has an A/V delay.
+    Sting detection runs in audio space; add (audio_start - video_start) to
+    any sting time before comparing it against a video-frame-based anchor.
+    """
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', stream,
+         '-show_entries', 'stream=start_time',
+         '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
+        capture_output=True, text=True, check=True)
+    lines = [l for l in r.stdout.strip().splitlines()
+             if l.strip() and l.strip() != 'N/A']
+    try:
+        return float(lines[0]) if lines else 0.0
+    except ValueError:
+        return 0.0
+
+
 def get_audio_stream_count(f):
     r = subprocess.run(
         ['ffprobe', '-v', 'error', '-select_streams', 'a',

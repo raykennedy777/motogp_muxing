@@ -21,11 +21,11 @@ Usage:
         <ziggo_file> <master.mkv> <output_dir>
 """
 
-import sys, subprocess
+import sys
 from pathlib import Path
 
 from src.utils.audio_utils import fmt, get_duration, get_audio_stream_count, \
-                        extract_seg, concat_segments_to_mka
+                        extract_seg, concat_segments_to_mka, get_video_start_pts
 from src.utils.sting_detection import find_all_transitions
 from src.utils.watermark_detection import (build_watermark_template,
                                   find_all_breaks_via_watermark)
@@ -36,22 +36,8 @@ WM_OUT_W, WM_OUT_H      = 64, 16
 WM_LAG_SECS             = 7.0    # watermark returns ~7s after lead-out clip ends
 WM_THRESH               = 0.44
 
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
-
-def get_pts_offset(src):
-    """Return video stream start_time (PTS offset) in seconds, or 0.0."""
-    r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-         '-show_entries', 'stream=start_time',
-         '-of', 'default=noprint_wrappers=1:nokey=1', str(src)],
-        capture_output=True, text=True, check=True)
-    lines = [l for l in r.stdout.strip().splitlines()
-             if l.strip() and l.strip() != 'N/A']
-    try:
-        return float(lines[0]) if lines else 0.0
-    except ValueError:
-        return 0.0
 
 
 STING_CONF_THRESH  = 0.3    # lower than default to catch weaker lead-out hits
@@ -283,7 +269,7 @@ def main():
         sys.exit(f'ERROR: Missing fingerprint: {fp_path}')
 
     # ── File info ──
-    pts_offset = get_pts_offset(ziggo_file)
+    pts_offset = get_video_start_pts(ziggo_file)
     d_ziggo    = get_duration(ziggo_file)
     d_master   = get_duration(master_file)
     print(f'Ziggo:      {d_ziggo:.1f}s  ({fmt(d_ziggo)})')

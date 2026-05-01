@@ -63,9 +63,9 @@ from pathlib import Path
 
 from src.utils.audio_utils import fmt, get_duration, get_audio_stream_count, \
                         extract_seg, concat_segments_to_mka
-from watermark_detection import (build_watermark_template,
-                                  build_watermark_template_averaged,
-                                  find_all_breaks_via_watermark)
+from src.utils.watermark_detection import (build_watermark_template,
+                                           build_watermark_template_averaged,
+                                           find_all_breaks_via_watermark)
 
 # ServusTV watermark parameters (1920x1080 source)
 WM_X     = 1653   # left edge

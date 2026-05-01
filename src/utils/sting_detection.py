@@ -48,6 +48,10 @@ def find_sting(src, fp_path, search_start, search_dur, stream_spec='0:a:0',
     return t, conf
 
 
+_CHUNK_SECS   = 300   # chunk size for in-memory FFT to avoid OOM on long files
+_OVERLAP_SECS = 15    # overlap between chunks to catch stings at boundaries
+
+
 def find_all_transitions(src, fp_paths, stream_spec='0:a:0', tmp_suffix='',
                          conf_thresh=CONF_THRESH, suppress_secs=SUPPRESS_SECS,
                          min_event_secs=MIN_EVENT_SECS):
@@ -56,6 +60,9 @@ def find_all_transitions(src, fp_paths, stream_spec='0:a:0', tmp_suffix='',
     fp_paths: str, Path, or list of either.
     Returns a sorted list of (time_sec, confidence, clip_dur_sec).
     Events before min_event_secs are discarded.
+
+    Uses chunked in-memory FFT (_CHUNK_SECS slices with _OVERLAP_SECS overlap)
+    to avoid MemoryError on long broadcast files.
     """
     if isinstance(fp_paths, (str, Path)):
         fp_paths = [fp_paths]
@@ -63,37 +70,51 @@ def find_all_transitions(src, fp_paths, stream_spec='0:a:0', tmp_suffix='',
     tmp = f'_tmp_full_scan{tmp_suffix}.wav'
     print('  Extracting full audio for transition scan...')
     extract_wav(src, tmp, stream_spec)
-    h = load_fp_wav(tmp)
+    h_full = load_fp_wav(tmp)
     try:
         os.remove(tmp)
     except FileNotFoundError:
         pass
 
+    chunk_samps   = int(_CHUNK_SECS   * SR)
+    overlap_samps = int(_OVERLAP_SECS * SR)
     all_hits = []   # (time, confidence, clip_dur)
 
     for fp_path in fp_paths:
         needle   = load_fp_wav(fp_path)
         clip_dur = len(needle) / SR
+        n_len    = len(needle)
+        supp     = int(suppress_secs * SR)
 
-        corr  = fftconvolve(h, needle[::-1], mode='valid')
-        abs_c = np.abs(corr)
-        n_len = len(needle)
-        supp  = int(suppress_secs * SR)
-        tmp_c = abs_c.copy()
+        chunk_start = 0
+        while chunk_start < len(h_full):
+            load_start = max(0, chunk_start - overlap_samps)
+            load_end   = min(len(h_full), chunk_start + chunk_samps)
+            h = h_full[load_start:load_end]
 
-        while True:
-            idx  = int(np.argmax(tmp_c))
-            h_w  = h[idx:idx + n_len]
-            conf = float(abs_c[idx]) / (
-                   np.linalg.norm(h_w) * np.linalg.norm(needle) + 1e-10)
-            if conf < conf_thresh:
-                break
-            t = idx / SR
-            if t >= min_event_secs:
-                all_hits.append((t, conf, clip_dur))
-            lo = max(0, idx - supp)
-            hi = min(len(tmp_c), idx + supp)
-            tmp_c[lo:hi] = 0
+            if len(h) < n_len:
+                chunk_start += chunk_samps
+                continue
+
+            corr  = fftconvolve(h, needle[::-1], mode='valid')
+            abs_c = np.abs(corr)
+            tmp_c = abs_c.copy()
+
+            while True:
+                idx  = int(np.argmax(tmp_c))
+                h_w  = h[idx:idx + n_len]
+                conf = float(abs_c[idx]) / (
+                       np.linalg.norm(h_w) * np.linalg.norm(needle) + 1e-10)
+                if conf < conf_thresh:
+                    break
+                t = (load_start + idx) / SR
+                if t >= min_event_secs:
+                    all_hits.append((t, conf, clip_dur))
+                lo = max(0, idx - supp)
+                hi = min(len(tmp_c), idx + supp)
+                tmp_c[lo:hi] = 0
+
+            chunk_start += chunk_samps
 
     # Merge and cross-fingerprint dedup: sort, suppress within suppress_secs
     all_hits.sort()

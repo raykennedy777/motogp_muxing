@@ -29,7 +29,7 @@ from pathlib import Path
 from src.utils.audio_utils import get_duration, get_audio_stream_count, extract_seg, concat_segments_to_mka
 from src.utils.sting_detection import find_sting
 
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 # Search windows per mode: (start_sec, duration_sec)
 STING_CFG = {
@@ -138,6 +138,9 @@ def main():
                         help='Opening sting duration to replace with NS (seconds).')
     parser.add_argument('--trim-end', type=float, default=0.0, metavar='S',
                         help='Closing sting duration to replace with NS (seconds).')
+    parser.add_argument('--offset', type=float, default=None, metavar='S',
+                        help='Direct sync offset (master_time = src_time + offset). '
+                             'Skips all sting detection.')
     parser.add_argument('--src-sting-time', type=float, default=None, metavar='S',
                         help='Override: known sting/anchor time in source (seconds).')
     parser.add_argument('--master-sting-time', type=float, default=None, metavar='S',
@@ -176,34 +179,40 @@ def main():
         src_start = max(0.0, d_src - 3000)
         src_window = (src_start, 900)
 
-    # Find sting in master
-    if args.master_sting_time is not None:
-        master_sting = args.master_sting_time
-        print(f'\nMaster anchor: {master_sting:.3f}s (manual override)')
+    # ── Sync anchor ──
+    if args.offset is not None:
+        src_sting    = 0.0
+        master_sting = args.offset
+        print(f'\nManual offset: {args.offset:.3f}s  (master_time = rsi_time + {args.offset:.3f})')
     else:
-        print(f'\nLocating {cfg["fp"]} in master...')
-        m_start, m_dur = cfg['master_window']
-        master_sting, master_conf = find_sting(
-            args.master_file, fp_sting,
-            m_start, m_dur, stream_spec=ns_stream,
-            label=f'  Sting (master)')
-        if master_conf < cfg['conf_thresh']:
-            sys.exit(f'ERROR: Sting not found in master (conf={master_conf:.4f}). '
-                     f'Use --master-sting-time to override.')
+        # Find sting in master
+        if args.master_sting_time is not None:
+            master_sting = args.master_sting_time
+            print(f'\nMaster anchor: {master_sting:.3f}s (manual override)')
+        else:
+            print(f'\nLocating {cfg["fp"]} in master...')
+            m_start, m_dur = cfg['master_window']
+            master_sting, master_conf = find_sting(
+                args.master_file, fp_sting,
+                m_start, m_dur, stream_spec=ns_stream,
+                label=f'  Sting (master)')
+            if master_conf < cfg['conf_thresh']:
+                sys.exit(f'ERROR: Sting not found in master (conf={master_conf:.4f}). '
+                         f'Use --master-sting-time to override.')
 
-    # Find sting in RSI source
-    if args.src_sting_time is not None:
-        src_sting = args.src_sting_time
-        print(f'Source anchor: {src_sting:.3f}s (manual override)')
-    else:
-        print(f'\nLocating {cfg["fp"]} in RSI source...')
-        src_sting, src_conf = find_sting(
-            args.rsi_file, fp_sting,
-            src_window[0], src_window[1], stream_spec='0:a:0',
-            label='  Sting (RSI)')
-        if src_conf < cfg['conf_thresh']:
-            sys.exit(f'ERROR: Sting not found in RSI source (conf={src_conf:.4f}). '
-                     f'Use --src-sting-time to override.')
+        # Find sting in RSI source
+        if args.src_sting_time is not None:
+            src_sting = args.src_sting_time
+            print(f'Source anchor: {src_sting:.3f}s (manual override)')
+        else:
+            print(f'\nLocating {cfg["fp"]} in RSI source...')
+            src_sting, src_conf = find_sting(
+                args.rsi_file, fp_sting,
+                src_window[0], src_window[1], stream_spec='0:a:0',
+                label='  Sting (RSI)')
+            if src_conf < cfg['conf_thresh']:
+                sys.exit(f'ERROR: Sting not found in RSI source (conf={src_conf:.4f}). '
+                         f'Use --src-sting-time to override.')
 
     print('\nBuilding output segments...')
     build_and_concat(

@@ -39,7 +39,7 @@ from src.utils.audio_utils import SR, get_duration, get_audio_stream_count, extr
 from src.utils.sting_detection import find_sting, find_all_transitions
 from src.utils.canal_watermark import detect_canal_breaks, fmt as wm_fmt
 
-FP_DIR = Path(__file__).parent / 'fingerprints'
+FP_DIR = Path(__file__).parent.parent.parent / 'fingerprints'
 
 
 # ── Silence detection ─────────────────────────────────────────────────────────
@@ -249,6 +249,7 @@ def build_and_concat(canal_file, master_file, canal_stream, ns_stream,
 
 def process_canal(canal_file, master_file, output_dir, dry_run,
                   anchor_source=None, anchor_master=None,
+                  offset_override=None,
                   content_end_secs=None, opening_dur_secs=None):
     """
     Unified Canal+ audio sync with consistent ad break detection.
@@ -262,8 +263,6 @@ def process_canal(canal_file, master_file, output_dir, dry_run,
       - canal_opening.wav
       - preshow_intro_m2m3.wav
       - prerace_sting_motogp.wav
-      - canal_m3m2_opening.wav
-
     Program start: canal_opening sting if --anchor-source not supplied
     """
     CANAL_STREAM = '0:a:0'
@@ -276,32 +275,15 @@ def process_canal(canal_file, master_file, output_dir, dry_run,
     print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
 
     # ── Sync anchor + program start detection ────────────────────────────────
-    if anchor_source is not None and anchor_master is not None:
+    if offset_override is not None:
+        offset = offset_override
+        print(f'\nManual offset: {offset:.3f}s')
+    elif anchor_source is not None and anchor_master is not None:
         offset = anchor_master - anchor_source
         print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
         print(f'  Offset: {offset:.3f}s')
     else:
-        print('\nLocating sync anchor...')
-        
-        # Try opening sting
-        fp_opening = str(FP_DIR / 'canal_opening.wav')
-        canal_opening, c_conf = find_sting(
-            canal_file, fp_opening, 600, 900, CANAL_STREAM, 'Opening sting (canal)',
-            tmp_suffix='_canal')
-
-        if c_conf < 0.1:
-            sys.exit(f'ERROR: Opening sting not found (conf={c_conf:.4f})')
-
-        anchor_source = canal_opening
-        print(f'  Using opening sting: {anchor_source:.1f}s (conf={c_conf:.4f})')
-
-        # Find corresponding position in master
-        master_opening, m_conf = find_sting(
-            master_file, fp_opening, 600, 900, ns_stream, 'Opening sting (master)',
-            tmp_suffix='_canal')
-        if m_conf < 0.05:
-            sys.exit(f'ERROR: Opening sting not found in master (conf={m_conf:.4f})')
-        offset = master_opening - anchor_source
+        sys.exit('ERROR: sprint mode requires --offset or --anchor-source + --anchor-master')
 
     if opening_dur_secs is not None:
         OPENING_DUR = opening_dur_secs
@@ -319,7 +301,6 @@ def process_canal(canal_file, master_file, output_dir, dry_run,
         str(FP_DIR / 'canal_opening.wav'),
         str(FP_DIR / 'preshow_intro_m2m3.wav'),
         str(FP_DIR / 'prerace_sting_motogp.wav'),
-        str(FP_DIR / 'canal_m3m2_opening.wav'),
     ]
 
     SEARCH_START = OPENING_DUR + 300
@@ -409,7 +390,7 @@ def process_canal(canal_file, master_file, output_dir, dry_run,
         content_windows = [(s, e) for s, e in content_windows if e > s + 1.0]
 
     print('\nBuilding output segments...')
-    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
+    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_sprint_synced.mka')
     build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
                      offset, d_canal, d_master, content_windows,
                      output_mka, dry_run, tmp_prefix='canal')
@@ -418,6 +399,7 @@ def process_canal(canal_file, master_file, output_dir, dry_run,
 
 def moto3_mode(canal_file, master_file, output_dir, dry_run,
                anchor_source=None, anchor_master=None,
+               offset_override=None,
                use_watermark=False, wm_fps=2, wm_min_break=15, wm_min_content=60,
                opening_dur_secs=None):
     """
@@ -434,23 +416,15 @@ def moto3_mode(canal_file, master_file, output_dir, dry_run,
     print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
 
     # ── Sync anchor ────────────────────────────────────────────────────────
-    if anchor_source is not None and anchor_master is not None:
+    if offset_override is not None:
+        offset = offset_override
+        print(f'\nManual offset: {offset:.3f}s')
+    elif anchor_source is not None and anchor_master is not None:
         offset = anchor_master - anchor_source
         print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
         print(f'  Offset: {offset:.3f}s')
     else:
-        print('\nLocating prerace sting (sync anchor)...')
-        fp_sting = str(FP_DIR / 'prerace_sting.wav')
-        canal_sting, c_conf = find_sting(
-            canal_file, fp_sting, 0, min(3600, d_canal), CANAL_STREAM,
-            'Prerace sting (canal)', tmp_suffix='_moto3')
-        master_sting, m_conf = find_sting(
-            master_file, fp_sting, 0, min(3600, d_master), ns_stream,
-            'Prerace sting (master)', tmp_suffix='_moto3')
-        if c_conf < 0.1 or m_conf < 0.1:
-            sys.exit(f'ERROR: Prerace sting not found '
-                     f'(canal={c_conf:.4f}, master={m_conf:.4f})')
-        offset = master_sting - canal_sting
+        sys.exit('ERROR: moto3 mode requires --offset or --anchor-source + --anchor-master')
 
     # ── Break detection ────────────────────────────────────────────────────
     if use_watermark:
@@ -463,7 +437,7 @@ def moto3_mode(canal_file, master_file, output_dir, dry_run,
         content_windows = [(OPENING_DUR, d_canal)]
 
     print('\nBuilding output segments...')
-    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
+    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_moto3_synced.mka')
     build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
                      offset, d_canal, d_master, content_windows,
                      output_mka, dry_run, tmp_prefix='moto3')
@@ -472,12 +446,14 @@ def moto3_mode(canal_file, master_file, output_dir, dry_run,
 
 def moto2_mode(canal_file, master_file, output_dir, dry_run,
                anchor_source=None, anchor_master=None,
-               use_watermark=False, wm_fps=2, wm_min_break=15, wm_min_content=60):
+               offset_override=None,
+               use_watermark=False, wm_fps=2, wm_min_break=15, wm_min_content=60,
+               opening_dur_secs=None):
     """
     Canal+ Moto2: opening trim + ad breaks + silence tail.
     """
     CANAL_STREAM = '0:a:0'
-    OPENING_DUR  = 12.0
+    OPENING_DUR  = opening_dur_secs if opening_dur_secs is not None else 12.0
 
     d_canal  = get_duration(canal_file)
     d_master = get_duration(master_file)
@@ -487,23 +463,15 @@ def moto2_mode(canal_file, master_file, output_dir, dry_run,
     print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
 
     # ── Sync anchor ────────────────────────────────────────────────────────
-    if anchor_source is not None and anchor_master is not None:
+    if offset_override is not None:
+        offset = offset_override
+        print(f'\nManual offset: {offset:.3f}s')
+    elif anchor_source is not None and anchor_master is not None:
         offset = anchor_master - anchor_source
         print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
         print(f'  Offset: {offset:.3f}s')
     else:
-        print('\nLocating prerace sting (sync anchor)...')
-        fp_sting = str(FP_DIR / 'prerace_sting.wav')
-        canal_sting, c_conf = find_sting(
-            canal_file, fp_sting, 0, min(3600, d_canal), CANAL_STREAM,
-            'Prerace sting (canal)', tmp_suffix='_moto2')
-        master_sting, m_conf = find_sting(
-            master_file, fp_sting, 0, min(3600, d_master), ns_stream,
-            'Prerace sting (master)', tmp_suffix='_moto2')
-        if c_conf < 0.1 or m_conf < 0.1:
-            sys.exit(f'ERROR: Prerace sting not found '
-                     f'(canal={c_conf:.4f}, master={m_conf:.4f})')
-        offset = master_sting - canal_sting
+        sys.exit('ERROR: moto2 mode requires --offset or --anchor-source + --anchor-master')
 
     # ── Break detection ────────────────────────────────────────────────────
     if use_watermark:
@@ -515,13 +483,15 @@ def moto2_mode(canal_file, master_file, output_dir, dry_run,
     else:
         print('\n-- Sting/silence break detection --')
         print('\nLocating break 1...')
-        fp_moto2_grid = str(FP_DIR / 'canal_moto2_grid_ending.wav')
+        fp_moto2_grid = str(FP_DIR / 'canal_grid_ending.wav')
         fp_opening    = str(FP_DIR / 'canal_opening.wav')
+        sting_search_start = max(300, OPENING_DUR - 60)
+        sting_search_dur   = min(1200, d_canal - sting_search_start)
         t_b1_start, _ = find_sting(
-            canal_file, fp_moto2_grid, 300, 900, CANAL_STREAM,
+            canal_file, fp_moto2_grid, sting_search_start, sting_search_dur, CANAL_STREAM,
             'Moto2 grid ending sting', tmp_suffix='_moto2')
         t_opening1, _ = find_sting(
-            canal_file, fp_opening, t_b1_start + 60, 1800, CANAL_STREAM,
+            canal_file, fp_opening, t_b1_start + 60, 1200, CANAL_STREAM,
             'Opening sting (break 1 end)', tmp_suffix='_moto2')
         t_b1_end = t_opening1 + 12.0
         print(f'  Break 1: {t_b1_start:.1f}s - {t_b1_end:.1f}s  '
@@ -545,7 +515,7 @@ def moto2_mode(canal_file, master_file, output_dir, dry_run,
         ]
 
     print('\nBuilding output segments...')
-    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
+    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_moto2_synced.mka')
     build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
                      offset, d_canal, d_master, content_windows,
                      output_mka, dry_run, tmp_prefix='moto2')
@@ -554,6 +524,7 @@ def moto2_mode(canal_file, master_file, output_dir, dry_run,
 
 def motogp_mode(canal_file, master_file, output_dir, dry_run,
                 anchor_source=None, anchor_master=None,
+                offset_override=None,
                 use_watermark=False, wm_fps=2, wm_min_break=15, wm_min_content=60,
                 content_end_secs=None):
     """
@@ -562,7 +533,7 @@ def motogp_mode(canal_file, master_file, output_dir, dry_run,
     Break detection (sting path):
     - Lead-outs: preshow_intro_m2m3.wav (17s) or prerace_sting_motogp.wav (65s)
     - Lead-ins: silence detection (backward search from each lead-out)
-    - Special: canal_zarco_ad.wav → canal_m3m2_opening.wav pair
+    - Special: canal_zarco_ad.wav → canal_opening.wav pair
     - content_end_secs: truncate at program end
     """
     CANAL_STREAM = '0:a:0'   # only first audio track
@@ -576,23 +547,15 @@ def motogp_mode(canal_file, master_file, output_dir, dry_run,
     print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
 
     # ── Sync anchor ────────────────────────────────────────────────────────
-    if anchor_source is not None and anchor_master is not None:
+    if offset_override is not None:
+        offset = offset_override
+        print(f'\nManual offset: {offset:.3f}s')
+    elif anchor_source is not None and anchor_master is not None:
         offset = anchor_master - anchor_source
         print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
         print(f'  Offset: {offset:.3f}s')
     else:
-        print('\nLocating podium anthem (sync anchor)...')
-        fp_anthem = str(FP_DIR / 'canal_motogp_anthem.wav')
-        canal_anthem, c_conf = find_sting(
-            canal_file, fp_anthem, 6253, 240, CANAL_STREAM, 'Anthem (canal)',
-            tmp_suffix='_motogp')
-        master_anthem, m_conf = find_sting(
-            master_file, fp_anthem, 5817, 300, ns_stream, 'Anthem (master)',
-            tmp_suffix='_motogp')
-        if c_conf < 0.05 or m_conf < 0.05:
-            print(f'  WARNING: Low anthem confidence '
-                  f'(canal={c_conf:.4f}, master={m_conf:.4f}) - check output')
-        offset = master_anthem - canal_anthem
+        sys.exit('ERROR: motogp mode requires --offset or --anchor-source + --anchor-master')
 
     # ── Break detection ────────────────────────────────────────────────────
     if use_watermark:
@@ -603,11 +566,10 @@ def motogp_mode(canal_file, master_file, output_dir, dry_run,
         content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
     else:
         print('\n-- Sting-based break detection --')
-        M3M2_OPENING_DUR = 13.0
-        fp_moto3_sting  = str(FP_DIR / 'preshow_intro_m2m3.wav')
-        fp_mgp_sting    = str(FP_DIR / 'prerace_sting_motogp.wav')
-        fp_zarco        = str(FP_DIR / 'canal_zarco_ad.wav')
-        fp_m3m2_opening = str(FP_DIR / 'canal_m3m2_opening.wav')
+        fp_moto3_sting = str(FP_DIR / 'preshow_intro_m2m3.wav')
+        fp_mgp_sting   = str(FP_DIR / 'prerace_sting_motogp.wav')
+        fp_zarco       = str(FP_DIR / 'canal_zarco_ad.wav')
+        fp_opening     = str(FP_DIR / 'canal_opening.wav')
         SILENCE_WINDOW  = 600.0
         MIN_SILENCE_SEC = 3.0
 
@@ -643,26 +605,26 @@ def motogp_mode(canal_file, master_file, output_dir, dry_run,
             else:
                 print(f'  No silence found — skipping lead-out at {t_out:.1f}s')
 
-        # Zarco ad sting: special lead-in with canal_m3m2_opening lead-out
+        # Zarco ad sting: special lead-in with canal_opening lead-out
         zarco_path = FP_DIR / 'canal_zarco_ad.wav'
         if zarco_path.exists():
             print('\nSearching for Zarco ad sting (special break lead-in)...')
-            zarco_search = max(OPENING_DUR, d_canal - 4000)
+            zarco_search = max(OPENING_DUR, d_canal - 2000)
             t_zarco, zarco_conf = find_sting(
                 canal_file, str(zarco_path),
-                zarco_search, 4000,
+                zarco_search, min(1200, d_canal - zarco_search),
                 CANAL_STREAM, 'Zarco ad sting', tmp_suffix='_motogp')
             if zarco_conf >= 0.1:
                 in_break = any(s <= t_zarco <= e for s, e in breaks)
                 if not in_break:
                     print(f'  Not within existing break — searching for opening sting lead-out...')
                     t_opening, op_conf = find_sting(
-                        canal_file, fp_m3m2_opening,
+                        canal_file, fp_opening,
                         t_zarco + 10, 300,
                         CANAL_STREAM, 'Opening sting (Zarco break end)',
                         tmp_suffix='_motogp')
                     if op_conf >= 0.05:
-                        t_zarco_end = t_opening + M3M2_OPENING_DUR
+                        t_zarco_end = t_opening + 12.0
                         print(f'  Zarco break: {t_zarco:.1f}s - {t_zarco_end:.1f}s  '
                               f'(dur={t_zarco_end-t_zarco:.1f}s)')
                         breaks.append((t_zarco, t_zarco_end))
@@ -703,154 +665,17 @@ def motogp_mode(canal_file, master_file, output_dir, dry_run,
         content_windows = [(s, e) for s, e in content_windows if e > s + 1.0]
 
     print('\nBuilding output segments...')
-    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
+    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_motogp_synced.mka')
     build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
                      offset, d_canal, d_master, content_windows,
                      output_mka, dry_run, tmp_prefix='motogp')
     print(f'\nDone -> {output_mka}')
 
 
-def moto3moto2_mode(canal_file, master_file, output_dir, dry_run,
-                    anchor_source=None, anchor_master=None,
-                    use_watermark=False, wm_fps=2, wm_min_break=15, wm_min_content=60,
-                    wm_scan_end=None,
-                    breaks_override=None, content_end_secs=None,
-                    opening_dur_secs=None):
-    """
-    Canal+ combined Moto3+Moto2 file: opening trim + ad breaks.
-    Uses frame-based anchor (--anchor-source / --anchor-master) for sync.
-
-    breaks_override: list of (start_secs, end_secs) tuples, bypasses all detection.
-    content_end_secs: truncate last content window at this time (end-of-program).
-    opening_dur_secs: override OPENING_DUR (default 12s). Use when canal file has
-                      a long pre-program lead-in before the actual coverage starts.
-    wm_scan_end: limit watermark scan to this time (seconds).
-    """
-    CANAL_STREAM = '0:a:0'
-    OPENING_DUR  = opening_dur_secs if opening_dur_secs is not None else 12.0
-
-    d_canal  = get_duration(canal_file)
-    d_master = get_duration(master_file)
-    n_audio  = get_audio_stream_count(master_file)
-    ns_stream = f'0:a:{n_audio-1}'
-    print(f'Canal:  {d_canal:.1f}s  ({d_canal/3600:.2f}h)')
-    print(f'Master: {d_master:.1f}s  ({d_master/3600:.2f}h)  NS: {ns_stream}')
-
-    # ── Sync anchor (frame-based, required) ──────────────────────────────────
-    if anchor_source is None or anchor_master is None:
-        sys.exit('ERROR: moto3moto2 mode requires --anchor-source and --anchor-master')
-    offset = anchor_master - anchor_source
-    print(f'\nFrame-based anchor: canal {anchor_source:.3f}s = master {anchor_master:.3f}s')
-    print(f'  Offset: {offset:.3f}s')
-
-    # ── Break detection ──────────────────────────────────────────────────────
-    if breaks_override is not None:
-        print(f'\n-- Using {len(breaks_override)} pre-specified break(s) --')
-        for i, (s, e) in enumerate(breaks_override):
-            h = int(s//3600); m2 = int((s%3600)//60); sec = s%60
-            print(f'  Break {i+1}: {h:02d}:{m2:02d}:{sec:05.2f} - '
-                  f'{int(e//3600):02d}:{int((e%3600)//60):02d}:{e%60:05.2f}  '
-                  f'dur={e-s:.1f}s')
-        breaks = breaks_override
-        content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
-    elif use_watermark:
-        print('\n-- Watermark break detection --')
-        scan_end_wm = wm_scan_end if wm_scan_end is not None else d_canal
-        breaks = detect_breaks_watermark(
-            canal_file, d_canal, scan_start=OPENING_DUR, scan_end=scan_end_wm,
-            min_break=wm_min_break, wm_fps=wm_fps, min_content=wm_min_content, tmp_suffix='_m3m2wm')
-        content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
-    else:
-        print('\n-- Sting-based break detection --')
-        M3M2_OPENING_DUR = 13.0  # duration of program opening sting (frames 21788-22111 = 12.92s)
-        fp_m3m2_opening = str(FP_DIR / 'canal_m3m2_opening.wav')
-        fp_moto2_grid   = str(FP_DIR / 'canal_moto2_grid_ending.wav')
-
-        # Step 1: locate program opening sting → OPENING_DUR
-        if opening_dur_secs is None:
-            print('\nLocating program opening sting (program start)...')
-            t_os, os_conf = find_sting(
-                canal_file, fp_m3m2_opening, 750, 300, CANAL_STREAM,
-                'Program opening sting', tmp_suffix='_m3m2')
-            if os_conf < 0.1:
-                sys.exit(f'ERROR: Program opening sting not found (conf={os_conf:.4f})')
-            OPENING_DUR = t_os + M3M2_OPENING_DUR
-            print(f'  Program starts at: {OPENING_DUR:.1f}s')
-
-        # Step 2: silence → break 1 start (after Moto3 race, ~1h+ into program)
-        print('\nLocating break 1 start (silence)...')
-        t_b1_start = find_silence_start(
-            canal_file, OPENING_DUR + 4000, 2000, CANAL_STREAM,
-            label='Silence (break 1 start)', min_silence_sec=3.0, tmp_suffix='_m3m2')
-        if t_b1_start is None:
-            sys.exit('ERROR: Could not find silence for break 1 start')
-
-        # Step 3: opening sting after break 1 silence → break 1 end
-        print('\nLocating break 1 end (opening sting)...')
-        t_os2, os2_conf = find_sting(
-            canal_file, fp_m3m2_opening, t_b1_start + 10, 300, CANAL_STREAM,
-            'Opening sting (break 1 end)', tmp_suffix='_m3m2')
-        if os2_conf < 0.05:
-            sys.exit(f'ERROR: Opening sting not found after break 1 silence '
-                     f'(conf={os2_conf:.4f})')
-        t_b1_end = t_os2 + M3M2_OPENING_DUR
-        print(f'  Break 1: {t_b1_start:.1f}s - {t_b1_end:.1f}s  '
-              f'(dur={t_b1_end-t_b1_start:.1f}s)')
-
-        # Step 4: Moto2 grid ending sting → break 2 start
-        print('\nLocating break 2 start (Moto2 grid ending sting)...')
-        t_b2_start, b2_conf = find_sting(
-            canal_file, fp_moto2_grid, t_b1_end + 60, 2000, CANAL_STREAM,
-            'Moto2 grid ending sting', tmp_suffix='_m3m2')
-        if b2_conf < 0.1:
-            sys.exit(f'ERROR: Moto2 grid ending sting not found after break 1 '
-                     f'(conf={b2_conf:.4f})')
-
-        # Step 5: opening sting after break 2 grid → break 2 end
-        print('\nLocating break 2 end (opening sting)...')
-        t_os3, os3_conf = find_sting(
-            canal_file, fp_m3m2_opening, t_b2_start + 10, 300, CANAL_STREAM,
-            'Opening sting (break 2 end)', tmp_suffix='_m3m2')
-        if os3_conf < 0.05:
-            sys.exit(f'ERROR: Opening sting not found after break 2 grid sting '
-                     f'(conf={os3_conf:.4f})')
-        t_b2_end = t_os3 + M3M2_OPENING_DUR
-        print(f'  Break 2: {t_b2_start:.1f}s - {t_b2_end:.1f}s  '
-              f'(dur={t_b2_end-t_b2_start:.1f}s)')
-
-        # Step 6: silence → end-of-program
-        print('\nLocating end-of-program (silence)...')
-        t_eop = find_silence_start(
-            canal_file, t_b2_end + 60, d_canal - t_b2_end - 60, CANAL_STREAM,
-            label='End-of-program silence', tmp_suffix='_m3m2')
-        if t_eop is None:
-            print('  NOTE: No silence found - using end of file')
-            t_eop = d_canal
-
-        content_windows = [
-            (OPENING_DUR, t_b1_start),
-            (t_b1_end,    t_b2_start),
-            (t_b2_end,    t_eop),
-        ]
-
-    # ── Apply content-end truncation ─────────────────────────────────────────
-    if content_end_secs is not None:
-        print(f'\n  Truncating content at {content_end_secs:.1f}s '
-              f'({int(content_end_secs//3600):02d}:{int((content_end_secs%3600)//60):02d}:'
-              f'{content_end_secs%60:05.2f})')
-        content_windows = [(s, min(e, content_end_secs)) for s, e in content_windows]
-        content_windows = [(s, e) for s, e in content_windows if e > s + 1.0]
-
-    print('\nBuilding output segments...')
-    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
-    build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
-                     offset, d_canal, d_master, content_windows,
-                     output_mka, dry_run, tmp_prefix='moto3moto2')
-    print(f'\nDone -> {output_mka}')
-
 
 def sunday_mode(canal_file, master_file, output_dir, dry_run,
                 anchor_source=None, anchor_master=None,
+                use_watermark=False,
                 wm_fps=2, wm_min_break=15, wm_min_content=60,
                 wm_scan_end=None,
                 breaks_override=None, content_end_secs=None,
@@ -892,7 +717,7 @@ def sunday_mode(canal_file, master_file, output_dir, dry_run,
                   f'dur={e-s:.1f}s')
         breaks = breaks_override
         content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
-    else:
+    elif use_watermark:
         print('\n-- Watermark break detection --')
         scan_end_wm = wm_scan_end if wm_scan_end is not None else d_canal
         breaks = detect_breaks_watermark(
@@ -900,6 +725,8 @@ def sunday_mode(canal_file, master_file, output_dir, dry_run,
             min_break=wm_min_break, wm_fps=wm_fps, min_content=wm_min_content,
             tmp_suffix='_sundaywm')
         content_windows = breaks_to_content_windows(breaks, d_canal, OPENING_DUR)
+    else:
+        sys.exit('ERROR: sunday mode requires --watermark or --breaks')
 
     # ── Apply content-end truncation ─────────────────────────────────────────
     if content_end_secs is not None:
@@ -910,7 +737,7 @@ def sunday_mode(canal_file, master_file, output_dir, dry_run,
         content_windows = [(s, e) for s, e in content_windows if e > s + 1.0]
 
     print('\nBuilding output segments...')
-    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_synced.mka')
+    output_mka = Path(output_dir) / (Path(canal_file).stem + '_canal_sunday_synced.mka')
     build_and_concat(canal_file, master_file, CANAL_STREAM, ns_stream,
                      offset, d_canal, d_master, content_windows,
                      output_mka, dry_run, tmp_prefix='sunday')
@@ -922,8 +749,7 @@ def sunday_mode(canal_file, master_file, output_dir, dry_run,
 def main():
     parser = argparse.ArgumentParser(
         description='Sync Canal+ French audio to a MotoGP master file.')
-    parser.add_argument('--race', choices=['sprint', 'moto3', 'moto2', 'motogp',
-                                           'moto3moto2', 'sunday'],
+    parser.add_argument('--race', choices=['sprint', 'moto3', 'moto2', 'motogp', 'sunday'],
                         default=None,
                         help='Race mode (default: unified sprint/general mode).')
     parser.add_argument('--dry-run', action='store_true',
@@ -938,6 +764,9 @@ def main():
                         help='Minimum content duration for watermark detection (default: 60s).')
     parser.add_argument('--wm-scan-end', type=float, default=None,
                         help='Limit watermark scan to this time (seconds).')
+    parser.add_argument('--offset', type=float, default=None,
+                        help='Direct sync offset (master_time = canal_time + offset). '
+                             'Skips all sting detection.')
     parser.add_argument('--anchor-source', type=float, default=None,
                         help='Frame-based anchor time in source file (seconds).')
     parser.add_argument('--anchor-master', type=float, default=None,
@@ -982,11 +811,13 @@ def main():
                 sys.exit(f'ERROR: Missing fingerprint: {p}')
         process_canal(args.canal_file, args.master_file, args.output_dir, args.dry_run,
                       anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                      offset_override=args.offset,
                       content_end_secs=args.content_end, opening_dur_secs=args.opening_dur)
 
     elif race == 'moto3':
         moto3_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
                    anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                   offset_override=args.offset,
                    use_watermark=args.watermark, wm_fps=args.wm_fps,
                    wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
                    opening_dur_secs=args.opening_dur)
@@ -994,28 +825,23 @@ def main():
     elif race == 'moto2':
         moto2_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
                    anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                   offset_override=args.offset,
                    use_watermark=args.watermark, wm_fps=args.wm_fps,
-                   wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content)
+                   wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
+                   opening_dur_secs=args.opening_dur)
 
     elif race == 'motogp':
         motogp_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
                     anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                    offset_override=args.offset,
                     use_watermark=args.watermark, wm_fps=args.wm_fps,
                     wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
                     content_end_secs=args.content_end)
 
-    elif race == 'moto3moto2':
-        moto3moto2_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
-                        anchor_source=args.anchor_source, anchor_master=args.anchor_master,
-                        use_watermark=args.watermark, wm_fps=args.wm_fps,
-                        wm_min_break=args.wm_min_break, wm_min_content=args.wm_min_content,
-                        wm_scan_end=args.wm_scan_end,
-                        breaks_override=breaks_override, content_end_secs=args.content_end,
-                        opening_dur_secs=args.opening_dur)
-
     elif race == 'sunday':
         sunday_mode(args.canal_file, args.master_file, args.output_dir, args.dry_run,
                     anchor_source=args.anchor_source, anchor_master=args.anchor_master,
+                    use_watermark=args.watermark,
                     wm_fps=args.wm_fps, wm_min_break=args.wm_min_break,
                     wm_min_content=args.wm_min_content, wm_scan_end=args.wm_scan_end,
                     breaks_override=breaks_override, content_end_secs=args.content_end,
